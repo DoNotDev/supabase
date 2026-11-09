@@ -10,10 +10,10 @@
  * @author AMBROISE PARK Consulting
  */
 
+import type { SupabaseClient } from '@supabase/supabase-js';
+
 import type { ICallableProvider } from '@donotdev/core';
 import { wrapCrudError, DoNotDevError } from '@donotdev/core';
-
-import type { SupabaseClient } from '@supabase/supabase-js';
 
 // =============================================================================
 // SupabaseCallableProvider

@@ -13,6 +13,7 @@ export { SupabaseCallableProvider } from './callableProvider';
 export { SupabaseCrudAdapter } from './crudAdapter';
 export { SupabaseStorageAdapter } from './storageAdapter';
 export { SupabaseAuth } from './auth';
+export { createBrowserClient } from './browserClient';
 
 export { createClient } from '@supabase/supabase-js';
 export type { SupabaseClient } from '@supabase/supabase-js';

@@ -9,6 +9,10 @@
  * @author AMBROISE PARK Consulting
  */
 
+import type { User as SupabaseUser } from '@supabase/supabase-js';
+import type { SupabaseClient } from '@supabase/supabase-js';
+import { stringFromBase64URL } from '@supabase/ssr';
+
 import type {
   AuthProvider,
   AuthUser,
@@ -23,6 +27,7 @@ import type {
   UserProfile,
   SecurityContext,
   AuthHardeningContext,
+  AuthSessionSnapshot,
 } from '@donotdev/core';
 import {
   isClient,
@@ -39,12 +44,14 @@ import {
 } from '@donotdev/core';
 import { AuthHardening } from '@donotdev/core';
 
-import type { User as SupabaseUser } from '@supabase/supabase-js';
-import type { SupabaseClient } from '@supabase/supabase-js';
+import { hasCookieSession } from './browserClient';
 
 // =============================================================================
 // Map Supabase User to AuthUser
 // =============================================================================
+
+/** Prefix @supabase/ssr puts on base64url-encoded cookie values. */
+const SESSION_COOKIE_BASE64_PREFIX = 'base64-';
 
 function mapSupabaseUserToAuthUser(user: SupabaseUser): AuthUser {
   const meta = (user.user_metadata ?? {}) as Record<string, unknown>;
@@ -106,6 +113,78 @@ export class SupabaseAuth implements AuthProvider {
   private readonly defaultHardening = new AuthHardening();
 
   constructor(private readonly client: SupabaseClient) {}
+
+  /**
+   * Signed-in state from the request cookies (AuthProvider.readSessionSnapshot).
+   * Only for a client created by `createBrowserClient` (session in cookies): with a
+   * localStorage session the cookies cannot tell, so this returns `null`.
+   * Reads the `sb-<ref>-auth-token` cookie (whole or chunked `.0`, `.1`…, optionally
+   * `base64-` encoded, as @supabase/ssr writes it). Display only: not verified.
+   */
+  readSessionSnapshot(cookieHeader: string): AuthSessionSnapshot | null {
+    if (!hasCookieSession(this.client)) return null;
+
+    const cookies = new Map<string, string>();
+    for (const part of cookieHeader.split(';')) {
+      const eq = part.indexOf('=');
+      if (eq === -1) continue;
+      const value = part.slice(eq + 1).trim();
+      let decoded = value;
+      try {
+        decoded = decodeURIComponent(value);
+      } catch {
+        // Kept raw: a malformed session cookie must read as "cannot tell", not absent.
+      }
+      cookies.set(part.slice(0, eq).trim(), decoded);
+    }
+
+    const keys = new Set<string>();
+    for (const name of cookies.keys()) {
+      const match = name.match(/^(sb-[^.]+-auth-token)(?:\.\d+)?$/);
+      if (match?.[1]) keys.add(match[1]);
+    }
+    if (keys.size === 0) return { user: null };
+    // Several Supabase projects on this domain: the cookie for this client is unknown.
+    if (keys.size > 1) return null;
+    const key = [...keys][0] as string;
+
+    let raw = cookies.get(key) ?? null;
+    if (raw === null) {
+      const chunks: string[] = [];
+      for (let i = 0; cookies.has(`${key}.${i}`); i++) {
+        chunks.push(cookies.get(`${key}.${i}`) as string);
+      }
+      raw = chunks.length > 0 ? chunks.join('') : null;
+    }
+    if (raw === null) return { user: null };
+
+    try {
+      const json = raw.startsWith(SESSION_COOKIE_BASE64_PREFIX)
+        ? stringFromBase64URL(raw.slice(SESSION_COOKIE_BASE64_PREFIX.length))
+        : raw;
+      const session = JSON.parse(json) as {
+        user?: SupabaseUser | null;
+        access_token?: string;
+        expires_at?: number;
+      } | null;
+      const user = session?.user
+        ? mapSupabaseUserToAuthUser(session.user)
+        : null;
+      // Token for request-scoped reads during the server render, only while it stays
+      // valid for the render (a minute of margin); an expired one would just be refused.
+      const accessToken =
+        user &&
+        typeof session?.access_token === 'string' &&
+        typeof session.expires_at === 'number' &&
+        session.expires_at * 1000 > Date.now() + 60_000
+          ? session.access_token
+          : undefined;
+      return accessToken ? { user, accessToken } : { user };
+    } catch {
+      // Partially written or foreign cookie: let the provider decide once ready.
+      return null;
+    }
+  }
 
   /**
    * Set store reference for state updates

@@ -33,6 +33,7 @@
  * @author AMBROISE PARK Consulting
  */
 
+import type { SupabaseClient } from '@supabase/supabase-js';
 import * as v from 'valibot';
 
 import {
@@ -68,8 +69,6 @@ import {
   defaultFieldMapper,
   getEntityFieldNames,
 } from '../common/fieldMapper';
-
-import type { SupabaseClient } from '@supabase/supabase-js';
 
 const DEFAULT_ID_COLUMN = 'id';
 
@@ -195,6 +194,45 @@ function applyWhere(
  * @version 0.1.0
  * @since 0.0.1
  */
+/**
+ * Framework role from Supabase `app_metadata` (JWT claims or session user).
+ * Signed in without an explicit role = 'user'; no session = 'guest'.
+ */
+function roleFromAppMetadata(
+  signedIn: boolean,
+  meta: Record<string, unknown> | undefined | null
+): UserRole {
+  if (!signedIn) return 'guest' as UserRole;
+  if (meta) {
+    if (meta.role === 'super' || meta.isSuper === true)
+      return 'super' as UserRole;
+    if (meta.role === 'admin' || meta.isAdmin === true)
+      return 'admin' as UserRole;
+    if (typeof meta.role === 'string' && meta.role)
+      return meta.role as UserRole;
+  }
+  return 'user' as UserRole;
+}
+
+/** Claims of a JWT (payload only, not verified: column choice, never authorisation). */
+function decodeJwtPayload(
+  token: string
+): { app_metadata?: Record<string, unknown> } | null {
+  const payload = token.split('.')[1];
+  if (!payload) return null;
+  try {
+    const base64 = payload.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4);
+    return JSON.parse(
+      new TextDecoder().decode(
+        Uint8Array.from(atob(padded), (c) => c.charCodeAt(0))
+      )
+    ) as { app_metadata?: Record<string, unknown> };
+  } catch {
+    return null;
+  }
+}
+
 /** Short-lived role cache (30s) — avoids a getSession() call on every read/query. */
 interface RoleCache {
   role: UserRole;
@@ -241,6 +279,38 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
   }
 
   /**
+   * Request-scoped view (ICrudAdapter.forAccessToken): reads send the visitor's access
+   * token, and columns are chosen for the role in its claims. Shares the client and
+   * mapper; registers no auth listener. Postgres (PostgREST) verifies the token, so a
+   * forged or expired one only gets an error, never someone else's rows.
+   */
+  forAccessToken(accessToken: string): SupabaseCrudAdapter {
+    const claims = decodeJwtPayload(accessToken);
+    const view = Object.create(this) as SupabaseCrudAdapter;
+    Object.defineProperties(view, {
+      requestToken: { value: accessToken },
+      requestRole: {
+        value: roleFromAppMetadata(true, claims?.app_metadata),
+      },
+    });
+    return view;
+  }
+
+  /** Request-scoped token (forAccessToken view), else unset. */
+  private readonly requestToken?: string;
+  /** Role of the request-scoped token, else unset. */
+  private readonly requestRole?: UserRole;
+
+  /** Sends the request-scoped token on a read, when this is a forAccessToken view. */
+  private asRequester<B extends { setHeader(name: string, value: string): B }>(
+    builder: B
+  ): B {
+    return this.requestToken
+      ? builder.setHeader('Authorization', `Bearer ${this.requestToken}`)
+      : builder;
+  }
+
+  /**
    * Invalidate the role cache immediately.
    * Call this when you know the session has changed (e.g., after sign-out) and cannot
    * wait for the auth state listener to fire.
@@ -275,24 +345,17 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
    * Falls back to 'guest' when no session exists.
    */
   private async getUserRole(): Promise<UserRole> {
+    if (this.requestRole) return this.requestRole;
     const now = Date.now();
     if (this._roleCache && now < this._roleCache.expiresAt) {
       return this._roleCache.role;
     }
     try {
       const { data } = await this.client.auth.getSession();
-      const meta = data?.session?.user?.app_metadata;
-      // Default: authenticated session = 'user', no session = 'guest'
-      const hasSession = !!data?.session;
-      let role: UserRole = (hasSession ? 'user' : 'guest') as UserRole;
-      if (meta) {
-        if (meta.role === 'super' || meta.isSuper === true)
-          role = 'super' as UserRole;
-        else if (meta.role === 'admin' || meta.isAdmin === true)
-          role = 'admin' as UserRole;
-        else if (meta.role) role = meta.role as UserRole;
-        // else: keep 'user' default for authenticated sessions without explicit role
-      }
+      const role = roleFromAppMetadata(
+        !!data?.session,
+        data?.session?.user?.app_metadata
+      );
       this._roleCache = { role, expiresAt: now + 30_000 };
       return role;
     } catch {
@@ -336,9 +399,9 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
     const role = schema ? await this.getUserRole() : ('guest' as UserRole);
     const selectCols = this.buildSelectColumns(schema, role);
 
-    const { data, error } = await this.client
-      .from(collection)
-      .select(selectCols)
+    const { data, error } = await this.asRequester(
+      this.client.from(collection).select(selectCols)
+    )
       .eq(this.idColumn, id)
       .maybeSingle();
 
@@ -767,9 +830,9 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
     const selectCols =
       schema && queryRole ? this.buildSelectColumns(schema, queryRole) : '*';
 
-    let q: SbFilterBuilder = this.client
-      .from(collection)
-      .select(selectCols, { count: 'exact' }) as unknown as SbFilterBuilder;
+    let q: SbFilterBuilder = this.asRequester(
+      this.client.from(collection).select(selectCols, { count: 'exact' })
+    ) as unknown as SbFilterBuilder;
 
     const toBackendField = (appField: string) =>
       this.mapper.toBackendField(appField);
@@ -804,12 +867,12 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
     let totalCount: number | undefined;
     if (cursor) {
       // Separate count query: same where/order filters but NO cursor filter
-      let countQ: SbFilterBuilder = this.client
-        .from(collection)
-        .select(selectCols, {
+      let countQ: SbFilterBuilder = this.asRequester(
+        this.client.from(collection).select(selectCols, {
           count: 'exact',
           head: true,
-        }) as unknown as SbFilterBuilder;
+        })
+      ) as unknown as SbFilterBuilder;
       if (options.where) {
         for (const clause of options.where) {
           countQ = applyWhere(countQ, clause, toBackendField);

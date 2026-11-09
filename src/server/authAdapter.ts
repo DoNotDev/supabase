@@ -11,6 +11,7 @@
  */
 
 import { createClient } from '@supabase/supabase-js';
+import type { SupabaseClient } from '@supabase/supabase-js';
 
 import type {
   IServerAuthAdapter,
@@ -18,8 +19,6 @@ import type {
   ServerUserRecord,
 } from '@donotdev/core';
 import { wrapAuthError, DoNotDevError } from '@donotdev/core';
-
-import type { SupabaseClient } from '@supabase/supabase-js';
 
 // =============================================================================
 // Server client factory

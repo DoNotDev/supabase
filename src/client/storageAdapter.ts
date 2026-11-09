@@ -9,14 +9,14 @@
  * @author AMBROISE PARK Consulting
  */
 
+import type { SupabaseClient } from '@supabase/supabase-js';
+
 import type {
   IStorageAdapter,
   UploadOptions,
   UploadResult,
 } from '@donotdev/core';
 import { wrapStorageError } from '@donotdev/core';
-
-import type { SupabaseClient } from '@supabase/supabase-js';
 
 /**
  * Supabase Storage adapter implementing IStorageAdapter.

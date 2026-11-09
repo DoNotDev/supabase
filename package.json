@@ -1,6 +1,6 @@
 {
   "name": "@donotdev/supabase",
-  "version": "0.1.44",
+  "version": "0.2.0",
   "private": false,
   "type": "module",
   "license": "MIT",
@@ -27,11 +27,12 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.76.14",
-    "valibot": "^1.2.0"
+    "@supabase/ssr": "^0.12.7",
+    "@supabase/supabase-js": "^2.119.0",
+    "valibot": "^1.5.0"
   },
   "peerDependencies": {
-    "@donotdev/core": "^0.1.43"
+    "@donotdev/core": "^0.2.0"
   },
   "peerDependenciesMeta": {},
   "devDependencies": {

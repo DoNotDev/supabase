@@ -228,9 +228,9 @@ describe('SupabaseCrudAdapter — ICrudAdapter contract', () => {
       singleError: new Error('insert failed'),
     });
     const ad = new SupabaseCrudAdapter(failingClient);
-    await expect(ad.add('users', { name: 'X' })).rejects.toThrow(
-      'insert failed'
-    );
+    await expect(ad.add('users', { name: 'X' })).rejects.toMatchObject({
+      details: expect.objectContaining({ originalMessage: 'insert failed' }),
+    });
   });
 
   it('get() throws when backend returns non-not-found error', async () => {
