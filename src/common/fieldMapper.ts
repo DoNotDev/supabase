@@ -105,10 +105,10 @@ const SYSTEM_FIELDS = [
  * @returns Array of entity field name strings
  */
 export function getEntityFieldNames(schema: unknown): string[] {
-  if (!schema || typeof schema !== 'object') return [];
-  const entries = (schema as Record<string, unknown>).entries;
+  if (!schema || typeof schema !== 'object' || !('entries' in schema)) return [];
+  const { entries } = schema;
   if (!entries || typeof entries !== 'object') return [];
-  return Object.keys(entries as Record<string, unknown>);
+  return Object.keys(entries);
 }
 
 /**

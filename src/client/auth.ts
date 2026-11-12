@@ -11,7 +11,6 @@
 
 import type { User as SupabaseUser } from '@supabase/supabase-js';
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { stringFromBase64URL } from '@supabase/ssr';
 
 import type {
   AuthProvider,
@@ -44,29 +43,15 @@ import {
 } from '@donotdev/core';
 import { AuthHardening } from '@donotdev/core';
 
-import { hasCookieSession } from './browserClient';
+import {
+  mapSupabaseUserToAuthUser,
+  readSupabaseSessionCookie,
+} from '../common/sessionCookie';
+import { hasCookieSession, setSessionOnly } from './browserClient';
 
 // =============================================================================
 // Map Supabase User to AuthUser
 // =============================================================================
-
-/** Prefix @supabase/ssr puts on base64url-encoded cookie values. */
-const SESSION_COOKIE_BASE64_PREFIX = 'base64-';
-
-function mapSupabaseUserToAuthUser(user: SupabaseUser): AuthUser {
-  const meta = (user.user_metadata ?? {}) as Record<string, unknown>;
-  const appMeta = (user.app_metadata ?? {}) as Record<string, unknown>;
-  return {
-    id: user.id,
-    email: user.email ?? undefined,
-    displayName:
-      (meta.full_name as string) ?? (meta.name as string) ?? undefined,
-    photoURL: (meta.avatar_url as string) ?? undefined,
-    emailVerified: !!user.email_confirmed_at,
-    role: (appMeta.role as UserRole) ?? 'guest',
-    customClaims: { ...meta, ...appMeta },
-  };
-}
 
 // Map AuthPartnerId to Supabase provider id (lowercase)
 const PARTNER_TO_SUPABASE: Partial<Record<string, string>> = {
@@ -88,6 +73,20 @@ const PARTNER_TO_SUPABASE: Partial<Record<string, string>> = {
   yahoo: 'yahoo',
   youtube: 'youtube',
 };
+
+/** OAuth provider id accepted by supabase-js. */
+type OAuthProvider = Parameters<
+  SupabaseClient['auth']['signInWithOAuth']
+>[0]['provider'];
+
+/**
+ * Supabase OAuth provider for a framework partner id (unmapped ids pass through).
+ * why: supabase-js exports `Provider` as a type-only union with no runtime list to guard against;
+ * an unknown id is rejected by Supabase Auth itself.
+ */
+function toOAuthProvider(partnerId: AuthPartnerId): OAuthProvider {
+  return (PARTNER_TO_SUPABASE[partnerId] ?? partnerId) as OAuthProvider;
+}
 
 // =============================================================================
 // SupabaseAuth
@@ -123,67 +122,7 @@ export class SupabaseAuth implements AuthProvider {
    */
   readSessionSnapshot(cookieHeader: string): AuthSessionSnapshot | null {
     if (!hasCookieSession(this.client)) return null;
-
-    const cookies = new Map<string, string>();
-    for (const part of cookieHeader.split(';')) {
-      const eq = part.indexOf('=');
-      if (eq === -1) continue;
-      const value = part.slice(eq + 1).trim();
-      let decoded = value;
-      try {
-        decoded = decodeURIComponent(value);
-      } catch {
-        // Kept raw: a malformed session cookie must read as "cannot tell", not absent.
-      }
-      cookies.set(part.slice(0, eq).trim(), decoded);
-    }
-
-    const keys = new Set<string>();
-    for (const name of cookies.keys()) {
-      const match = name.match(/^(sb-[^.]+-auth-token)(?:\.\d+)?$/);
-      if (match?.[1]) keys.add(match[1]);
-    }
-    if (keys.size === 0) return { user: null };
-    // Several Supabase projects on this domain: the cookie for this client is unknown.
-    if (keys.size > 1) return null;
-    const key = [...keys][0] as string;
-
-    let raw = cookies.get(key) ?? null;
-    if (raw === null) {
-      const chunks: string[] = [];
-      for (let i = 0; cookies.has(`${key}.${i}`); i++) {
-        chunks.push(cookies.get(`${key}.${i}`) as string);
-      }
-      raw = chunks.length > 0 ? chunks.join('') : null;
-    }
-    if (raw === null) return { user: null };
-
-    try {
-      const json = raw.startsWith(SESSION_COOKIE_BASE64_PREFIX)
-        ? stringFromBase64URL(raw.slice(SESSION_COOKIE_BASE64_PREFIX.length))
-        : raw;
-      const session = JSON.parse(json) as {
-        user?: SupabaseUser | null;
-        access_token?: string;
-        expires_at?: number;
-      } | null;
-      const user = session?.user
-        ? mapSupabaseUserToAuthUser(session.user)
-        : null;
-      // Token for request-scoped reads during the server render, only while it stays
-      // valid for the render (a minute of margin); an expired one would just be refused.
-      const accessToken =
-        user &&
-        typeof session?.access_token === 'string' &&
-        typeof session.expires_at === 'number' &&
-        session.expires_at * 1000 > Date.now() + 60_000
-          ? session.access_token
-          : undefined;
-      return accessToken ? { user, accessToken } : { user };
-    } catch {
-      // Partially written or foreign cookie: let the provider decide once ready.
-      return null;
-    }
+    return readSupabaseSessionCookie(cookieHeader);
   }
 
   /**
@@ -207,8 +146,6 @@ export class SupabaseAuth implements AuthProvider {
 
   /**
    * Active hardening context — SecurityContext's when injected, otherwise the default instance.
-   * Typed as `AuthHardeningContext` (the interface) — do NOT cast to the concrete `AuthHardening`
-   * class, as a custom implementation may not return `LockoutResult` from `recordFailure`.
    */
   private get _hardening(): AuthHardeningContext {
     return this.security?.authHardening ?? this.defaultHardening;
@@ -233,14 +170,12 @@ export class SupabaseAuth implements AuthProvider {
   }
 
   private _recordFailure(email: string): void {
-    this._hardening.recordFailure(email);
-    // Detect lockout by attempting a check — checkLockout throws if the account is now locked.
-    // Safe here: _checkLockout already ran before this attempt; if it passed, the account was
-    // NOT locked before. If checkLockout throws now, this failure triggered the lockout.
-    try {
-      this._hardening.checkLockout(email);
-    } catch {
-      this.security?.audit({ type: 'auth.locked' });
+    const result = this._hardening.recordFailure(email);
+    if (result.locked) {
+      this.security?.audit({
+        type: 'auth.locked',
+        metadata: { attempts: result.attempts },
+      });
     }
     this.security?.audit({ type: 'auth.login.failure' });
   }
@@ -295,7 +230,10 @@ export class SupabaseAuth implements AuthProvider {
     // In a real app, you might fetch this from a 'subscriptions' table
     const subscription: UserSubscription = {
       userId: user.id,
-      tier: (user.customClaims?.tier as string) || SUBSCRIPTION_TIERS.FREE,
+      tier:
+        (typeof user.customClaims?.tier === 'string' &&
+          user.customClaims.tier) ||
+        SUBSCRIPTION_TIERS.FREE,
       status: 'active',
       isActive: true,
       features: [],
@@ -444,6 +382,8 @@ export class SupabaseAuth implements AuthProvider {
       // Network error or expired session — proceed with sign-out anyway
     }
     await this.client.auth.signOut();
+    // The "do not remember me" choice belongs to the session that just ended.
+    if (hasCookieSession(this.client)) setSessionOnly(false);
     this.store?.setUnauthenticated();
     safeSessionStorage.removeItem('dndev.auth.returnTo');
     this.security?.audit({ type: 'auth.logout', userId });
@@ -527,7 +467,7 @@ export class SupabaseAuth implements AuthProvider {
           'SupabaseAuth',
           'updateUserProfile'
         );
-      const meta = (user.user_metadata ?? {}) as Record<string, unknown>;
+      const meta: Record<string, unknown> = user.user_metadata ?? {};
       const next = {
         full_name: updates.displayName ?? meta.full_name,
         name: updates.displayName ?? meta.name,
@@ -600,25 +540,21 @@ export class SupabaseAuth implements AuthProvider {
   async hasRole(role: UserRole): Promise<boolean> {
     const user = await this.getCurrentUser();
     if (!user) return false;
-    const userRole = (user as AuthUser).role ?? 'guest';
+    const userRole = user.role ?? 'guest';
     return hasRoleAccess(userRole, role);
   }
 
   async hasFeature(featureId: string): Promise<boolean> {
     const user = await this.getCurrentUser();
     if (!user?.customClaims) return false;
-    const features = (user.customClaims as Record<string, unknown>).features as
-      | string[]
-      | undefined;
+    const features: unknown = user.customClaims.features;
     return Array.isArray(features) && features.includes(featureId);
   }
 
   async hasTier(requiredTier: string): Promise<boolean> {
     const user = await this.getCurrentUser();
     if (!user?.customClaims) return false;
-    const tier = (user.customClaims as Record<string, unknown>).tier as
-      | string
-      | undefined;
+    const tier: unknown = user.customClaims.tier;
     return tier === requiredTier;
   }
 
@@ -654,9 +590,7 @@ export class SupabaseAuth implements AuthProvider {
    */
   private async handlePopupOAuth(
     partnerId: AuthPartnerId,
-    provider: Parameters<
-      SupabaseClient['auth']['signInWithOAuth']
-    >[0]['provider']
+    provider: OAuthProvider
   ): Promise<AuthResult | null> {
     const { data, error } = await this.client.auth.signInWithOAuth({
       provider,
@@ -769,17 +703,10 @@ export class SupabaseAuth implements AuthProvider {
     const authMethod = getAuthMethod(method);
 
     try {
-      const provider =
-        PARTNER_TO_SUPABASE[partnerId as string] ?? (partnerId as string);
-      type OAuthProvider = Parameters<
-        SupabaseClient['auth']['signInWithOAuth']
-      >[0]['provider'];
+      const provider = toOAuthProvider(partnerId);
 
       if (authMethod === 'popup') {
-        return await this.handlePopupOAuth(
-          partnerId,
-          provider as OAuthProvider
-        );
+        return await this.handlePopupOAuth(partnerId, provider);
       }
 
       // Redirect flow (production default)
@@ -792,7 +719,7 @@ export class SupabaseAuth implements AuthProvider {
       }
 
       const { data, error } = await this.client.auth.signInWithOAuth({
-        provider: provider as OAuthProvider,
+        provider,
         options: {
           redirectTo: isClient() ? window.location.origin : undefined,
         },
@@ -821,19 +748,15 @@ export class SupabaseAuth implements AuthProvider {
     _method?: AuthMethod
   ): Promise<AuthResult | null> {
     try {
-      const provider =
-        PARTNER_TO_SUPABASE[partnerId as string] ?? (partnerId as string);
-      type OAuthProvider = Parameters<
-        SupabaseClient['auth']['signInWithOAuth']
-      >[0]['provider'];
-      const { data, error } = await this.client.auth.linkIdentity({
-        provider: provider as OAuthProvider,
-      } as Parameters<SupabaseClient['auth']['linkIdentity']>[0]);
+      // OAuth link returns { provider, url } (no user): the user is read after linking
+      const { error } = await this.client.auth.linkIdentity({
+        provider: toOAuthProvider(partnerId),
+      });
       if (error)
         throw wrapAuthError(error, 'SupabaseAuth', 'linkWithPartner', {
           partnerId,
         });
-      const user = data?.user ?? (await this.client.auth.getUser()).data?.user;
+      const user = (await this.client.auth.getUser()).data?.user;
       return user
         ? { user: mapSupabaseUserToAuthUser(user), success: true }
         : null;
@@ -863,15 +786,21 @@ export class SupabaseAuth implements AuthProvider {
     }
   }
 
-  async sendEmailVerification(): Promise<void> {
+  async sendEmailVerification(email?: string): Promise<void> {
     try {
-      const {
-        data: { user },
-      } = await this.client.auth.getUser();
-      if (!user?.email) return;
+      // Sign-up with email confirmation leaves no session: the caller passes the address.
+      const address =
+        email ?? (await this.client.auth.getUser()).data.user?.email;
+      if (!address) {
+        throw wrapAuthError(
+          new Error('No email address to send the verification to'),
+          'SupabaseAuth',
+          'sendEmailVerification'
+        );
+      }
       const { error } = await this.client.auth.resend({
         type: 'signup',
-        email: user.email,
+        email: address,
       });
       if (error)
         throw wrapAuthError(error, 'SupabaseAuth', 'sendEmailVerification');
@@ -945,7 +874,7 @@ export class SupabaseAuth implements AuthProvider {
         error,
       } = await this.client.auth.verifyOtp({
         token_hash: token,
-        type: type as 'magiclink' | 'email',
+        type,
       });
       if (error) return null;
       return user
@@ -1031,19 +960,15 @@ export class SupabaseAuth implements AuthProvider {
     const authMethod = getAuthMethod(method);
 
     try {
-      const provider =
-        PARTNER_TO_SUPABASE[partnerId as string] ?? (partnerId as string);
-      type OAuthProvider = Parameters<
-        SupabaseClient['auth']['signInWithOAuth']
-      >[0]['provider'];
+      const provider = toOAuthProvider(partnerId);
 
       if (authMethod === 'popup') {
-        await this.handlePopupOAuth(partnerId, provider as OAuthProvider);
+        await this.handlePopupOAuth(partnerId, provider);
         return;
       }
 
       const { data, error } = await this.client.auth.signInWithOAuth({
-        provider: provider as OAuthProvider,
+        provider,
         options: {
           redirectTo: isClient() ? window.location.origin : undefined,
         },
@@ -1082,10 +1007,12 @@ export class SupabaseAuth implements AuthProvider {
         return;
       }
 
-      const err = new Error(
-        'Account deletion requires a server endpoint. Configure a callable provider or deploy a delete-account Edge Function.'
-      ) as Error & { code?: string };
-      err.code = 'DELETE_ACCOUNT_REQUIRES_SERVER';
+      const err = Object.assign(
+        new Error(
+          'Account deletion requires a server endpoint. Configure a callable provider or deploy a delete-account Edge Function.'
+        ),
+        { code: 'DELETE_ACCOUNT_REQUIRES_SERVER' }
+      );
       throw wrapAuthError(err, 'SupabaseAuth', 'deleteAccount');
     } catch (error) {
       if (error instanceof DoNotDevError) throw error;
@@ -1093,6 +1020,25 @@ export class SupabaseAuth implements AuthProvider {
     }
   }
 
-  // setRememberMe not implemented — Supabase doesn't support runtime storage swap.
-  // Backlog: needs proper solution (custom storage adapter at createClient time).
+  /** Remember me needs the cookie client (createBrowserClient); localStorage cannot. */
+  supportsRememberMe(): boolean {
+    return hasCookieSession(this.client);
+  }
+
+  /**
+   * Persistent (`true`) or session-only (`false`) auth cookies for the next sign-in.
+   * Throws on a client that does not keep its session in cookies.
+   */
+  async setRememberMe(remember: boolean): Promise<void> {
+    if (!this.supportsRememberMe()) {
+      throw wrapAuthError(
+        new Error(
+          'Remember me needs the cookie client: create the Supabase client with createBrowserClient from @donotdev/supabase'
+        ),
+        'SupabaseAuth',
+        'setRememberMe'
+      );
+    }
+    setSessionOnly(!remember);
+  }
 }

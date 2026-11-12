@@ -16,6 +16,7 @@ const KEY = 'sb-abcdref-auth-token';
 const session = {
   access_token: 'token',
   refresh_token: 'refresh',
+  expires_at: Math.floor(Date.now() / 1000) + 3600,
   user: {
     id: 'u1',
     email: 'pro@example.com',
@@ -84,14 +85,26 @@ describe('SupabaseAuth.readSessionSnapshot access token', () => {
     expect(cookieAuth().readSessionSnapshot(withExpiry(inAnHour))?.accessToken).toBe('token');
   });
 
-  it('drops an expired or nearly expired token (the browser refreshes it)', () => {
+  it('drops a nearly expired token, keeping the user (still signed in)', () => {
     const now = Math.floor(Date.now() / 1000);
-    expect(cookieAuth().readSessionSnapshot(withExpiry(now - 10))?.accessToken).toBeUndefined();
     expect(cookieAuth().readSessionSnapshot(withExpiry(now + 30))?.accessToken).toBeUndefined();
-    expect(cookieAuth().readSessionSnapshot(withExpiry(now - 10))?.user?.id).toBe('u1');
+    expect(cookieAuth().readSessionSnapshot(withExpiry(now + 30))?.user?.id).toBe('u1');
   });
 
-  it('has no token without an expiry', () => {
-    expect(cookieAuth().readSessionSnapshot(`${KEY}=${encodeURIComponent(encoded)}`)?.accessToken).toBeUndefined();
+  /**
+   * Regression: an expired session counted as signed in (proxy signedInRedirect sent a
+   * visitor whose refresh token was dead to /catalogue; useAuth reported the user).
+   */
+  it('cannot tell once the access token has expired: only a refresh knows', () => {
+    const now = Math.floor(Date.now() / 1000);
+    expect(cookieAuth().readSessionSnapshot(withExpiry(now - 10))).toBeNull();
+    expect(cookieAuth().readSessionSnapshot(withExpiry(now))).toBeNull();
+  });
+
+  it('cannot tell without an expiry', () => {
+    const { expires_at: _expiresAt, ...undated } = session;
+    expect(
+      cookieAuth().readSessionSnapshot(`${KEY}=${encodeURIComponent(JSON.stringify(undated))}`)
+    ).toBeNull();
   });
 });

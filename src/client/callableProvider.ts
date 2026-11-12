@@ -16,6 +16,36 @@ import type { ICallableProvider } from '@donotdev/core';
 import { wrapCrudError, DoNotDevError } from '@donotdev/core';
 
 // =============================================================================
+// Helpers
+// =============================================================================
+
+/**
+ * Body of a non-2xx Edge Function response, `{ error, code? }` as written by the
+ * framework handlers (e.g. a `createDeleteAccount` `beforeDelete` refusal).
+ * `FunctionsHttpError.context` is the raw `Response`; its body is still unread.
+ * Returns null when the error carries no JSON body with a string `error`.
+ */
+async function readServerError(
+  error: unknown
+): Promise<{ serverMessage: string; serverCode?: string } | null> {
+  const response =
+    typeof error === 'object' && error !== null && 'context' in error
+      ? error.context
+      : undefined;
+  if (!(response instanceof Response)) return null;
+  const body: unknown = await response
+    .clone()
+    .json()
+    .catch(() => null);
+  if (typeof body !== 'object' || body === null) return null;
+  const { error: message, code } = body as { error?: unknown; code?: unknown };
+  if (typeof message !== 'string') return null;
+  return typeof code === 'string'
+    ? { serverMessage: message, serverCode: code }
+    : { serverMessage: message };
+}
+
+// =============================================================================
 // SupabaseCallableProvider
 // =============================================================================
 
@@ -91,6 +121,7 @@ export class SupabaseCallableProvider implements ICallableProvider {
       const targetFunction = isCrudOp ? this.crudFunctionName : functionName;
 
       // For CRUD ops, add _functionName to body for dispatch routing
+      // why: CallableProvider's TReq is unconstrained; callable payloads are JSON objects by contract
       const body = isCrudOp
         ? { _functionName: functionName, ...(data as Record<string, unknown>) }
         : (data as Record<string, unknown>);
@@ -103,14 +134,21 @@ export class SupabaseCallableProvider implements ICallableProvider {
       );
 
       if (error) {
-        throw wrapCrudError(
+        const wrapped = wrapCrudError(
           error instanceof Error ? error : new Error(String(error)),
           'SupabaseCallableProvider',
           'call',
           functionName
         );
+        const server = await readServerError(error);
+        if (!server) throw wrapped;
+        throw new DoNotDevError(wrapped.message, wrapped.code, {
+          source: wrapped.source,
+          details: { ...wrapped.details, ...server },
+        });
       }
 
+      // why: CallableProvider's TRes is caller-asserted; the function's response has no schema here
       return result as TRes;
     } catch (error) {
       if (error instanceof DoNotDevError) throw error;

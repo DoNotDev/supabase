@@ -91,28 +91,26 @@ Deno.serve(serve);
 
 **Result:** Auto-generates create, get, list, update, delete, aggregate, and bulk handlers for each entity. The dispatcher routes via `_functionName` in the request body.
 
-### Bulk (atomic multi-row writes)
+### Bulk (multi-row writes, partial success)
 
-`createSupabaseCrudFunctions` auto-registers a `bulk_${collection}` handler for every entity. One HTTP round-trip, one rate-limit hit, one audit line, one Postgres transaction — inserts, updates, and deletes run in input order and roll back together on any failure.
+`SupabaseCrudAdapter.bulk()` writes directly through PostgREST under RLS — the same path as `add` / `update` / `delete`. No edge function, no migration.
 
 ```typescript
-// Client — via the Supabase CRUD adapter:
-const result = await crudAdapter.bulk('events', {
-  inserts: [{ title: 'A' }, { title: 'B' }],
-  updates: [{ id: 'e1', patch: { title: 'renamed' } }],
-  deletes: ['e2'],
+const result = await crudAdapter.bulk('products', {
+  updates: ids.map((id) => ({ id, patch: { size: '50 ml' } })),
+  deletes: ['p9'],
 });
-// → { insertedIds: [...], updatedIds: ['e1'], deletedIds: ['e2'] } in input order.
+// → { insertedIds: [], updatedIds: [...written], deletedIds: [], failed: [{ op: 'delete', id: 'p9', error: '…' }] }
 ```
 
-**Atomicity contract:**
-- All ops succeed or none do. Any error triggers `ROLLBACK`; the client sees a rejected promise with zero partial state.
-- Id collisions (same id in `updates` + `deletes`, or `inserts` + `updates`) reject up-front with `BulkCollisionError` before any write.
-- Empty bulk (`{}`) is a no-op — zero DB roundtrips, zeroed response.
-- Per-row validation (`create` schema on inserts, `update` schema on update patches) runs before the transaction opens.
-- ACL: the strictest role across `access.create` / `access.update` / `access.delete` is required; per-bucket role is re-checked server-side.
+**Contract:**
+- Partial success: rows that are written stay written; rows that are not are returned in `failed` with the reason (no rollback).
+- Requests: deletes `.delete().in(id, ids)`, inserts one array insert, updates grouped by identical patch (`.update(patch).in(id, ids)`; one value on N rows = one request). Ids chunked by 100, 6 requests in flight.
+- Rows RLS skips or that do not exist are not returned by the write and are reported failed ("affected 0 rows"), like `update()` / `delete()`.
+- Session required (nothing written without one); `createdById` / `updatedById` stamped; timestamps left to the DB; camelCase → snake_case mapping as for single-row writes.
+- Id collisions (same id in `updates` + `deletes`, or `inserts` + `updates`) reject up-front with `BulkCollisionError` before any write. Empty bulk (`{}`) is a no-op.
 
-The handler dispatches via a `crud_bulk(p_collection, p_inserts, p_updates, p_deletes)` Postgres RPC that owns the `BEGIN / COMMIT / ROLLBACK`. Install it via the Supabase migration shipped with the provider; without it the handler returns an `internal` error.
+Server side, `createSupabaseCrudFunctions` still registers a `bulk_${collection}` edge handler (transactional, `crud_bulk` RPC migration) for server code that needs one transaction; the client adapter does not use it.
 
 ### Custom Functions (typed)
 
@@ -219,6 +217,8 @@ You never set timestamps in app code - the DB owns them.
 |----------|---------|
 | `VITE_SUPABASE_URL` | Project URL (public) |
 | `VITE_SUPABASE_PUBLIC_KEY` | Public key (safe in bundle) |
+
+**Client (Next.js):** `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_PUBLIC_KEY`. With `createBrowserClient` the generated `src/proxy.next.ts` reads them too: it refreshes the session on every page request (`refreshSupabaseSession` from `@donotdev/supabase/server`) and throws without them.
 
 **Server (Edge Functions, API routes):** use the same URL and `SUPABASE_SECRET_KEY` for admin operations. Never expose the service_role key to the client. Put it in `.dndev.secrets` at project root (or your host's env for production).
 

@@ -1,6 +1,6 @@
 {
   "name": "@donotdev/supabase",
-  "version": "0.2.0",
+  "version": "0.2.3",
   "private": false,
   "type": "module",
   "license": "MIT",
@@ -32,7 +32,7 @@
     "valibot": "^1.5.0"
   },
   "peerDependencies": {
-    "@donotdev/core": "^0.2.0"
+    "@donotdev/core": "^0.2.3"
   },
   "peerDependenciesMeta": {},
   "devDependencies": {

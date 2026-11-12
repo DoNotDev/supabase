@@ -17,8 +17,8 @@ import type {
   IServerAuthAdapter,
   VerifiedToken,
   ServerUserRecord,
-} from '@donotdev/core';
-import { wrapAuthError, DoNotDevError } from '@donotdev/core';
+} from '@donotdev/core/server';
+import { wrapAuthError, DoNotDevError } from '@donotdev/core/server';
 
 // =============================================================================
 // Server client factory
@@ -46,6 +46,25 @@ export function createServerClient(
   });
 }
 
+/** A string property of an error-like value. */
+function stringProp(value: unknown, key: string): string | undefined {
+  if (typeof value !== 'object' || value === null || !(key in value)) {
+    return undefined;
+  }
+  const prop: unknown = Reflect.get(value, key);
+  return typeof prop === 'string' ? prop : undefined;
+}
+
+/** An SDK auth error as an Error (non-Error payloads keep their message). */
+function toAuthError(error: unknown): Error {
+  if (error instanceof Error) return error;
+  return new Error(
+    stringProp(error, 'message') ||
+      stringProp(error, 'error_description') ||
+      String(error)
+  );
+}
+
 // =============================================================================
 // Supabase Server Auth Adapter
 // =============================================================================
@@ -69,15 +88,11 @@ export class SupabaseServerAuthAdapter implements IServerAuthAdapter {
       } = await this.client.auth.getUser(token);
 
       if (error) {
-        const err =
-          error instanceof Error
-            ? error
-            : new Error(
-                (error as { message?: string }).message ||
-                  (error as { error_description?: string }).error_description ||
-                  String(error)
-              );
-        throw wrapAuthError(err, 'SupabaseServerAuthAdapter', 'verifyToken');
+        throw wrapAuthError(
+          toAuthError(error),
+          'SupabaseServerAuthAdapter',
+          'verifyToken'
+        );
       }
       if (!user) {
         throw wrapAuthError(
@@ -93,7 +108,7 @@ export class SupabaseServerAuthAdapter implements IServerAuthAdapter {
         claims: {
           ...user.user_metadata,
           ...user.app_metadata,
-        } as Record<string, unknown>,
+        },
       };
     } catch (error) {
       if (error instanceof DoNotDevError) throw error;
@@ -109,7 +124,7 @@ export class SupabaseServerAuthAdapter implements IServerAuthAdapter {
 
     if (error || !user) return null;
 
-    const meta = (user.user_metadata ?? {}) as Record<string, unknown>;
+    const meta: Record<string, unknown> = user.user_metadata ?? {};
     const displayName =
       typeof meta.full_name === 'string'
         ? meta.full_name
@@ -121,8 +136,8 @@ export class SupabaseServerAuthAdapter implements IServerAuthAdapter {
       email: user.email ?? undefined,
       displayName,
       customClaims: {
-        ...(user.user_metadata as Record<string, unknown>),
-        ...(user.app_metadata as Record<string, unknown>),
+        ...user.user_metadata,
+        ...user.app_metadata,
       },
     };
   }
@@ -140,16 +155,8 @@ export class SupabaseServerAuthAdapter implements IServerAuthAdapter {
         app_metadata: claims,
       });
       if (error) {
-        const err =
-          error instanceof Error
-            ? error
-            : new Error(
-                (error as { message?: string }).message ||
-                  (error as { error_description?: string }).error_description ||
-                  String(error)
-              );
         throw wrapAuthError(
-          err,
+          toAuthError(error),
           'SupabaseServerAuthAdapter',
           'setCustomClaims',
           { uid }

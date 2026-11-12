@@ -10,7 +10,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 import type { ICrudAdapter } from '@donotdev/core';
 
-import { SupabaseCrudAdapter } from '../client/crudAdapter';
+import { SupabaseCrudAdapter } from '../common/crudAdapter';
 
 // =============================================================================
 // Mock Supabase client (PostgREST / channel stubs)
@@ -221,6 +221,20 @@ describe('SupabaseCrudAdapter — ICrudAdapter contract', () => {
     expect(
       result.lastVisible === null || typeof result.lastVisible === 'string'
     ).toBe(true);
+  });
+
+  it('query() serializes not-in as a PostgREST list literal', async () => {
+    const mockClient = createMockSupabaseClient();
+    const ad = new SupabaseCrudAdapter(mockClient);
+    await ad.query('apartments', {
+      where: [
+        { field: 'status', operator: 'not-in', value: ['draft', 'deleted'] },
+      ],
+    });
+
+    const table = mockClient.from.mock.results[0]?.value;
+    const chain = table.select.mock.results[0]?.value;
+    expect(chain.not).toHaveBeenCalledWith('status', 'in', '("draft","deleted")');
   });
 
   it('add() throws when insert returns error', async () => {

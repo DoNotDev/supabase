@@ -10,7 +10,7 @@
  */
 
 export { SupabaseCallableProvider } from './callableProvider';
-export { SupabaseCrudAdapter } from './crudAdapter';
+export { SupabaseCrudAdapter } from '../common/crudAdapter';
 export { SupabaseStorageAdapter } from './storageAdapter';
 export { SupabaseAuth } from './auth';
 export { createBrowserClient } from './browserClient';

@@ -8,7 +8,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-import type { AuthProvider } from '@donotdev/core';
+import type { AuthProvider, SecurityContext } from '@donotdev/core';
 
 import { SupabaseAuth } from '../client/auth';
 
@@ -191,5 +191,36 @@ describe('SupabaseAuth — AuthProvider contract', () => {
     await expect(
       provider.sendPasswordResetEmail('reset@example.com')
     ).resolves.toBeUndefined();
+  });
+});
+
+describe('SupabaseAuth — lockout audit', () => {
+  // Regression: recordFailure's result drives the 'auth.locked' audit event.
+  it('audits auth.locked with the attempt count when a failure locks the account', async () => {
+    const client = createMockSupabaseClient();
+    const provider = new SupabaseAuth(client);
+    const audit = vi.fn();
+    provider.setSecurity({
+      audit,
+      authHardening: {
+        checkLockout: vi.fn(),
+        recordFailure: vi.fn().mockReturnValue({ locked: true, attempts: 5 }),
+        recordSuccess: vi.fn(),
+      },
+    } as unknown as SecurityContext);
+    vi.mocked(client.auth.signInWithPassword).mockResolvedValueOnce({
+      data: { user: null, session: null },
+      error: new Error('invalid'),
+    } as never);
+
+    await expect(
+      provider.signInWithEmailAndPassword('a@example.com', 'bad')
+    ).rejects.toThrow();
+
+    expect(audit).toHaveBeenCalledWith({
+      type: 'auth.locked',
+      metadata: { attempts: 5 },
+    });
+    expect(audit).toHaveBeenCalledWith({ type: 'auth.login.failure' });
   });
 });

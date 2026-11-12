@@ -209,6 +209,45 @@ describe('SupabaseCallableProvider — ICallableProvider contract', () => {
     );
   });
 
+  it('carries the non-2xx response body { error, code } in details', async () => {
+    // FunctionsHttpError shape: message + context = the raw Response
+    const httpError = Object.assign(
+      new Error('Edge Function returned a non-2xx status code'),
+      {
+        context: new Response(
+          JSON.stringify({ error: 'open_orders', code: 'P0001' }),
+          { status: 409 }
+        ),
+      }
+    );
+    const p = new SupabaseCallableProvider(
+      createMockSupabaseClient({ invokeResult: { data: null, error: httpError } })
+    );
+
+    const err = await p.call('delete-account', {}).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DoNotDevError);
+    expect((err as DoNotDevError).message).toBe('Request failed.');
+    expect((err as DoNotDevError).details).toMatchObject({
+      serverMessage: 'open_orders',
+      serverCode: 'P0001',
+    });
+  });
+
+  it('adds no server details when the response body is not JSON', async () => {
+    const httpError = Object.assign(new Error('non-2xx'), {
+      context: new Response('<html>bad gateway</html>', { status: 502 }),
+    });
+    const p = new SupabaseCallableProvider(
+      createMockSupabaseClient({ invokeResult: { data: null, error: httpError } })
+    );
+
+    const err = (await p
+      .call('delete-account', {})
+      .catch((e: unknown) => e)) as DoNotDevError;
+    expect(err).toBeInstanceOf(DoNotDevError);
+    expect(err.details?.serverMessage).toBeUndefined();
+  });
+
   it('preserves DoNotDevError when re-thrown', async () => {
     const invoke = vi.mocked(client.functions.invoke);
     invoke.mockRejectedValue(

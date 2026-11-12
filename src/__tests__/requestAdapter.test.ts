@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
-import { SupabaseCrudAdapter } from '../client/crudAdapter';
+import { SupabaseCrudAdapter } from '../common/crudAdapter';
 
 /** JWT with the given claims (signature irrelevant: PostgREST verifies, not us). */
 function jwt(claims: Record<string, unknown>): string {

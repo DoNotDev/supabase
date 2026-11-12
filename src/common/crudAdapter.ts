@@ -1,4 +1,4 @@
-// packages/providers/supabase/src/client/crudAdapter.ts
+// packages/providers/supabase/src/common/crudAdapter.ts
 
 /**
  * @fileoverview Supabase CRUD Adapter
@@ -38,8 +38,6 @@ import * as v from 'valibot';
 
 import {
   BulkCollisionError,
-  BulkRequestSchema,
-  BulkResponseSchema,
   detectBulkCollisions,
   wrapCrudError,
   validateWithSchema,
@@ -50,6 +48,7 @@ import {
   getVisibleFields,
 } from '@donotdev/core';
 import type {
+  BulkFailure,
   BulkOperations,
   BulkResult,
   ICrudAdapter,
@@ -58,7 +57,6 @@ import type {
   PaginatedQueryResult,
   DocumentSubscriptionCallback,
   CollectionSubscriptionCallback,
-  CrudOperator,
   CrudOperationOptions,
   dndevSchema,
 } from '@donotdev/core';
@@ -68,11 +66,88 @@ import {
   createEntityAwareMapper,
   defaultFieldMapper,
   getEntityFieldNames,
-} from '../common/fieldMapper';
+} from './fieldMapper';
 
 const DEFAULT_ID_COLUMN = 'id';
 
+/** Rows a write returns with `.select(idColumn)` (null when the request failed). */
+const RETURNED_ROWS_SCHEMA = v.nullable(v.array(v.record(v.string(), v.unknown())));
+/** A returned row's id column value. */
+const ROW_ID_SCHEMA = v.union([v.string(), v.number()]);
+/** One PostgREST row: the select string is built at runtime, so the SDK cannot type it. */
+const ROW_SCHEMA = v.record(v.string(), v.unknown());
+/** Rows of a query (null when the request failed). */
+const QUERY_ROWS_SCHEMA = v.nullable(v.array(ROW_SCHEMA));
+/** JWT claims read for column choice (other claims are ignored). */
+const JWT_CLAIMS_SCHEMA = v.object({
+  app_metadata: v.optional(v.record(v.string(), v.unknown())),
+});
+
+/** Ids (or rows) per bulk request: keeps `in.(…)` filters well under URL limits. */
+const BULK_CHUNK_SIZE = 100;
+/** Bulk requests in flight at once. */
+const BULK_CONCURRENCY = 6;
+
+/** Split `items` into consecutive chunks of at most `size`. */
+function chunked<I>(items: I[], size: number): I[][] {
+  const chunks: I[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
+/** Run `tasks` with at most `limit` in flight; resolves when all have settled. */
+async function runConcurrently(
+  tasks: Array<() => Promise<void>>,
+  limit: number
+): Promise<void> {
+  let next = 0;
+  const worker = async () => {
+    while (next < tasks.length) {
+      const task = tasks[next++]!;
+      await task();
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(limit, tasks.length) }, worker)
+  );
+}
+
+/** Message of a thrown value or a PostgREST error object. */
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === 'object' && 'message' in err) {
+    return String(err.message);
+  }
+  return String(err);
+}
+
 /** Strip timestamp fields so the DB sets them (DEFAULT now() / trigger). */
+/**
+ * Entity data (`T`) as a row record.
+ * why: ICrudAdapter's `T` is unconstrained, so TS cannot prove an entity is a record.
+ */
+function entityRecord<T>(data: T): Record<string, unknown> {
+  return data as Record<string, unknown>;
+}
+
+/**
+ * A normalized row as the caller's entity type.
+ * why: ICrudAdapter's `T` is caller-asserted; rows are mapped and visibility-filtered, not validated against `T`.
+ */
+function asEntity<T>(row: Record<string, unknown>): T {
+  return row as T;
+}
+
+/**
+ * The SDK builder as the structural filter chain used by query().
+ * why: supabase-js types a runtime select string as a parser error type; the chain methods used are the same.
+ */
+function toFilterBuilder<B>(builder: B): SbFilterBuilder {
+  return builder as unknown as SbFilterBuilder;
+}
+
 function stripTimestampFields(
   payload: Record<string, unknown>
 ): Record<string, unknown> {
@@ -126,6 +201,16 @@ function sanitizePostgrestFilterValue(value: string): string {
   return value;
 }
 
+/**
+ * PostgREST list literal for `not(col, 'in', …)`: `("a","b")`. `.not()` serializes its
+ * value verbatim (`not.in.a,b` without parentheses is rejected by PostgREST), unlike
+ * `.in()`, which formats the list itself. Values are double-quoted so commas and
+ * parentheses inside a value stay literal.
+ */
+function postgrestList(values: readonly unknown[]): string {
+  return `(${values.map((v) => JSON.stringify(String(v))).join(',')})`;
+}
+
 /** Ensure field is a string before mapper (framework must never pass schema/object as field). */
 function ensureStringField(field: unknown, context: string): string {
   if (typeof field === 'string') return field;
@@ -143,7 +228,7 @@ function applyWhere(
 ): SbFilterBuilder {
   const { field, operator, value } = clause;
   const col = toBackendField(ensureStringField(field, 'where'));
-  switch (operator as CrudOperator) {
+  switch (operator) {
     case CRUD_OPERATORS.EQ:
       return q.eq(col, value);
     case CRUD_OPERATORS.NEQ:
@@ -159,7 +244,11 @@ function applyWhere(
     case CRUD_OPERATORS.IN:
       return q.in(col, Array.isArray(value) ? value : [value]);
     case CRUD_OPERATORS.NOT_IN:
-      return q.not(col, 'in', Array.isArray(value) ? value : [value]);
+      return q.not(
+        col,
+        'in',
+        postgrestList(Array.isArray(value) ? value : [value])
+      );
     case CRUD_OPERATORS.ARRAY_CONTAINS:
       return q.contains(col, value);
     case CRUD_OPERATORS.ARRAY_CONTAINS_ANY:
@@ -173,7 +262,7 @@ function applyWhere(
       return q.overlaps(col, value);
     default:
       throw new DoNotDevError(
-        `SupabaseCrudAdapter: unsupported operator "${operator as string}"`,
+        `SupabaseCrudAdapter: unsupported operator "${String(operator)}"`,
         ERROR_CODES.INVALID_ARGUMENT,
         { context: { operator, field } }
       );
@@ -202,16 +291,13 @@ function roleFromAppMetadata(
   signedIn: boolean,
   meta: Record<string, unknown> | undefined | null
 ): UserRole {
-  if (!signedIn) return 'guest' as UserRole;
+  if (!signedIn) return 'guest';
   if (meta) {
-    if (meta.role === 'super' || meta.isSuper === true)
-      return 'super' as UserRole;
-    if (meta.role === 'admin' || meta.isAdmin === true)
-      return 'admin' as UserRole;
-    if (typeof meta.role === 'string' && meta.role)
-      return meta.role as UserRole;
+    if (meta.role === 'super' || meta.isSuper === true) return 'super';
+    if (meta.role === 'admin' || meta.isAdmin === true) return 'admin';
+    if (typeof meta.role === 'string' && meta.role) return meta.role;
   }
-  return 'user' as UserRole;
+  return 'user';
 }
 
 /** Claims of a JWT (payload only, not verified: column choice, never authorisation). */
@@ -223,11 +309,14 @@ function decodeJwtPayload(
   try {
     const base64 = payload.replace(/-/g, '+').replace(/_/g, '/');
     const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4);
-    return JSON.parse(
-      new TextDecoder().decode(
-        Uint8Array.from(atob(padded), (c) => c.charCodeAt(0))
+    return v.parse(
+      JWT_CLAIMS_SCHEMA,
+      JSON.parse(
+        new TextDecoder().decode(
+          Uint8Array.from(atob(padded), (c) => c.charCodeAt(0))
+        )
       )
-    ) as { app_metadata?: Record<string, unknown> };
+    );
   } catch {
     return null;
   }
@@ -260,6 +349,12 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
   readonly dbLevelSecurity = true;
   private readonly mapper: typeof defaultFieldMapper;
   private _roleCache: RoleCache | null = null;
+  /**
+   * Translation columns (`<column>_i18n`, fields defined with `i18n: true`) the database
+   * does not have yet, per table. Left out of selects: reads serve the default language
+   * until the migration adds them. Shared with forAccessToken views (prototype).
+   */
+  private readonly missingTranslationColumns = new Map<string, Set<string>>();
   private readonly _unsubscribeAuthState: () => void;
 
   constructor(
@@ -286,6 +381,7 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
    */
   forAccessToken(accessToken: string): SupabaseCrudAdapter {
     const claims = decodeJwtPayload(accessToken);
+    // why: Object.create returns any; the view is a prototype child of this adapter
     const view = Object.create(this) as SupabaseCrudAdapter;
     Object.defineProperties(view, {
       requestToken: { value: accessToken },
@@ -359,7 +455,7 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
       this._roleCache = { role, expiresAt: now + 30_000 };
       return role;
     } catch {
-      return 'guest' as UserRole;
+      return 'guest';
     }
   }
 
@@ -369,6 +465,7 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
    * Falls back to '*' if schema is unavailable or getVisibleFields returns empty.
    */
   private buildSelectColumns(
+    collection: string,
     schema: dndevSchema<unknown> | undefined,
     role: UserRole
   ): string {
@@ -381,10 +478,36 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
       // Always include id + status (required for framework logic)
       cols.add(this.idColumn);
       cols.add('status');
+      const missing = this.missingTranslationColumns.get(collection);
+      if (missing) for (const col of missing) cols.delete(col);
       return Array.from(cols).join(',');
     } catch {
       return '*';
     }
+  }
+
+  /**
+   * True when `error` is Postgres 42703 (undefined column) on a translation column not
+   * yet known missing: the column is recorded so the retried select leaves it out.
+   * Any other error returns false and is thrown as usual.
+   */
+  private noteMissingTranslationColumn(
+    collection: string,
+    error: { code?: string; message?: string }
+  ): boolean {
+    if (error.code !== '42703') return false;
+    const column = /column \S+?\.(\w+) does not exist/.exec(
+      error.message ?? ''
+    )?.[1];
+    if (!column?.endsWith('_i18n')) return false;
+    const missing = this.missingTranslationColumns.get(collection) ?? new Set();
+    if (missing.has(column)) return false;
+    missing.add(column);
+    this.missingTranslationColumns.set(collection, missing);
+    console.warn(
+      `[SupabaseCrudAdapter] ${collection}.${column} does not exist: serving the default language for that field. Apply the migration that adds it.`
+    );
+    return true;
   }
 
   async get<T>(
@@ -396,8 +519,8 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
     if (options?.signal?.aborted) {
       throw new Error('Operation cancelled');
     }
-    const role = schema ? await this.getUserRole() : ('guest' as UserRole);
-    const selectCols = this.buildSelectColumns(schema, role);
+    const role: UserRole = schema ? await this.getUserRole() : 'guest';
+    const selectCols = this.buildSelectColumns(collection, schema, role);
 
     const { data, error } = await this.asRequester(
       this.client.from(collection).select(selectCols)
@@ -406,6 +529,8 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
       .maybeSingle();
 
     if (error) {
+      if (this.noteMissingTranslationColumn(collection, error))
+        return this.get<T>(collection, id, schema, options);
       // PGRST116 = no rows returned — not found, return null
       if (error.code === 'PGRST116' || error.message?.includes('No rows'))
         return null;
@@ -413,7 +538,7 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
     }
     if (!data) return null;
 
-    const record = data as unknown as Record<string, unknown>;
+    const record = v.parse(ROW_SCHEMA, data);
     // Use the actual DB id value, not the caller-supplied parameter, to prevent stale ID injection.
     const docId = String(record[this.idColumn] ?? id);
     const row = { ...record, id: docId };
@@ -421,14 +546,10 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
     const entityMapper = this.createEntityMapper(schema);
     const normalized = entityMapper.fromBackendRow(row);
     if (schema) {
-      const filtered = filterVisibleFields(
-        normalized as Record<string, any>,
-        schema,
-        role
-      );
-      return { ...filtered, id: docId } as T;
+      const filtered = filterVisibleFields(normalized, schema, role);
+      return asEntity<T>({ ...filtered, id: docId });
     }
-    return { ...normalized, id: docId } as T;
+    return asEntity<T>({ ...normalized, id: docId });
   }
 
   async add<T>(
@@ -443,7 +564,7 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
     const validated = schema
       ? validateWithSchema(schema, data, 'SupabaseCrudAdapter.add')
       : data;
-    const payload = stripTimestampFields(validated as Record<string, unknown>);
+    const payload = stripTimestampFields(entityRecord(validated));
 
     // Require authenticated session for writes — same as Firebase; avoids orphaned rows and RLS bypass.
     let userId: string | undefined;
@@ -489,13 +610,9 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
         collection
       );
 
-    const id = String(
-      (inserted as Record<string, unknown>)[this.idColumn] ?? ''
-    );
-    const out = this.mapper.fromBackendRow({
-      ...(inserted as Record<string, unknown>),
-      id,
-    });
+    const insertedRow = v.parse(ROW_SCHEMA, inserted);
+    const id = String(insertedRow[this.idColumn] ?? '');
+    const out = this.mapper.fromBackendRow({ ...insertedRow, id });
     return { id, data: out };
   }
 
@@ -536,7 +653,7 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
       );
     }
     const payload = stripTimestampFields({
-      ...(validated as Record<string, unknown>),
+      ...entityRecord(validated),
       [this.idColumn]: id,
       updatedById: userId,
     });
@@ -595,7 +712,7 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
     }
 
     const payload = stripTimestampFields({
-      ...(data as Record<string, unknown>),
+      ...entityRecord(data),
       updatedById: userId,
     });
     const { data: updated, error } = await this.client
@@ -683,55 +800,48 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
   }
 
   /**
-   * Atomic bulk operation across one collection. Inserts, updates and deletes
-   * are dispatched in a single round-trip to the `crud` edge function, which
-   * routes to the `bulk_${collection}` handler via `_functionName` and runs
-   * all three buckets inside one Postgres transaction (`crud_bulk` RPC). Any
-   * failure rolls back — the client observes all-or-nothing.
+   * Bulk write on one collection: direct PostgREST calls under RLS, the same path
+   * as {@link add} / {@link update} / {@link delete} (no edge function).
    *
-   * Field-mapping (camelCase → snake_case) is applied at this boundary for
-   * `inserts` rows and `updates[].patch` so the server receives backend-shaped
-   * payloads. `deletes` are opaque ids and pass through unmapped. Response ids
-   * are opaque strings and are returned as-is.
+   * Partial success: rows that are written stay written; rows that are not are
+   * returned in `failed` with the reason. Requests:
+   * - inserts: one array insert per chunk (a chunk is one statement, it succeeds
+   *   or fails as a whole); a row failing schema validation fails alone;
+   * - updates: grouped by identical patch, one `.update(patch).in(id, ids)` per
+   *   group chunk (the bulk-bar case of one value on N rows is one request);
+   * - deletes: one `.delete().in(id, ids)` per chunk.
+   * Rows RLS skips or that do not exist are not returned by the write and are
+   * reported failed ("affected 0 rows"), like `update()` / `delete()`.
+   * Requests run with bounded concurrency.
    *
-   * @throws {BulkCollisionError} if an id appears in both `updates` and
-   *   `deletes`, or in both `inserts` (when carrying an explicit id) and
-   *   `updates`. Thrown before any network call — re-thrown unwrapped.
-   * @throws {DoNotDevError} when the edge function rejects, the response
-   *   shape fails {@link BulkResponseSchema}, or the request body fails
-   *   {@link BulkRequestSchema}. Wrapped via {@link wrapCrudError}.
+   * Field mapping (camelCase → snake_case), timestamp stripping and
+   * `createdById` / `updatedById` stamping match the single-row methods.
+   *
+   * @throws {BulkCollisionError} an id in two buckets — before any network call.
+   * @throws {DoNotDevError} no authenticated session (nothing attempted).
    *
    * @example
    * ```typescript
-   * const result = await adapter.bulk<Event>('events', {
-   *   inserts: [{ title: 'A' }, { title: 'B' }],
-   *   updates: [{ id: 'e1', patch: { title: 'renamed' } }],
-   *   deletes: ['e2', 'e3'],
+   * const r = await adapter.bulk<Product>('products', {
+   *   updates: [{ id: 'p1', patch: { size: '50 ml' } }, { id: 'p2', patch: { size: '50 ml' } }],
+   *   deletes: ['p3'],
    * });
-   * result.insertedIds; // ['evt_…', 'evt_…']
-   * result.updatedIds;  // ['e1']
-   * result.deletedIds;  // ['e2', 'e3']
+   * r.updatedIds; // ['p1', 'p2']
+   * r.failed;     // [{ op: 'delete', id: 'p3', error: 'Delete affected 0 rows: …' }]
    * ```
    */
   async bulk<T extends Record<string, unknown>>(
     collection: string,
     ops: BulkOperations<T>,
-    _schema?: dndevSchema<T>,
+    schema?: dndevSchema<T>,
     options?: CrudOperationOptions
   ): Promise<BulkResult> {
     if (options?.signal?.aborted) {
       throw new Error('Operation cancelled');
     }
 
-    // 1. Collision detection runs before any I/O so BulkCollisionError is
-    //    raised unwrapped, independent of transport.
-    const collision = detectBulkCollisions(
-      ops as {
-        inserts?: Array<{ id?: string; [k: string]: unknown }>;
-        updates?: Array<{ id: string; patch: unknown }>;
-        deletes?: string[];
-      }
-    );
+    // 1. Collision detection before any I/O; BulkCollisionError re-thrown unwrapped.
+    const collision = detectBulkCollisions(ops);
     if (collision.where !== null) {
       throw new BulkCollisionError(collision.collisions, collision.where);
     }
@@ -740,80 +850,190 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
     const updates = ops.updates ?? [];
     const deletes = ops.deletes ?? [];
 
-    // 2. Empty short-circuit — no network call, no audit row.
+    // 2. Empty short-circuit — no network call.
     if (inserts.length === 0 && updates.length === 0 && deletes.length === 0) {
-      return { insertedIds: [], updatedIds: [], deletedIds: [] };
+      return { insertedIds: [], updatedIds: [], deletedIds: [], failed: [] };
     }
 
-    // 3. Field-mapping: app camelCase → backend snake_case on writes. Matches
-    //    the boundary enforced by add()/update() via `mapper.toBackendKeys()`.
-    //    Deletes are opaque ids and are not mapped.
-    const mappedInserts = inserts.map((row) =>
-      this.mapper.toBackendKeys(row as Record<string, unknown>)
-    );
-    const mappedUpdates = updates.map((u) => ({
-      id: u.id,
-      patch: this.mapper.toBackendKeys(u.patch as Record<string, unknown>),
-    }));
+    // 3. Same security boundary as the single-row writes: a session is required.
+    const userId = await this.requireSessionUserId('bulk', collection);
 
-    const body = {
-      inserts: mappedInserts,
-      updates: mappedUpdates,
-      deletes,
-    };
+    const failed: BulkFailure[] = [];
+    const tasks: Array<() => Promise<void>> = [];
 
-    // 4. Validate body shape before putting it on the wire. Fail loud on
-    //    structural issues — no silent degradation.
-    const parsedBody = v.safeParse(BulkRequestSchema, body);
-    if (!parsedBody.success) {
-      throw wrapCrudError(
-        new Error(
-          `SupabaseCrudAdapter.bulk: invalid request body — ${parsedBody.issues
-            .map((i) => i.message)
-            .join('; ')}`
-        ),
-        'SupabaseCrudAdapter',
-        'bulk',
-        collection
-      );
-    }
-
-    // 5. Dispatch via the shared `crud` edge function using the same
-    //    `_functionName` routing contract as add()/update() when they go
-    //    through SupabaseCallableProvider. The server resolves
-    //    `bulk_${collection}` from `registerCrudFunctions`.
-    const { data: result, error } = await this.client.functions.invoke('crud', {
-      body: {
-        _functionName: `bulk_${collection}`,
-        ...parsedBody.output,
-      },
+    // 4. Inserts — validate per row, then one array insert per chunk.
+    const insertRows: Array<{ index: number; row: Record<string, unknown> }> = [];
+    inserts.forEach((row, index) => {
+      try {
+        const validated = schema
+          ? validateWithSchema(schema, row, 'SupabaseCrudAdapter.bulk')
+          : row;
+        insertRows.push({
+          index,
+          row: this.mapper.toBackendKeys({
+            ...stripTimestampFields(validated),
+            createdById: userId,
+            updatedById: userId,
+          }),
+        });
+      } catch (err) {
+        failed.push({ op: 'insert', index, error: errorMessage(err) });
+      }
     });
+    const insertedByIndex = new Map<number, string>();
+    for (const chunk of chunked(insertRows, BULK_CHUNK_SIZE)) {
+      tasks.push(async () => {
+        const { data, error } = await this.client
+          .from(collection)
+          .insert(chunk.map((c) => c.row))
+          .select(this.idColumn)
+          .then(
+            (res) => res,
+            (thrown: unknown) => ({ data: null, error: thrown })
+          );
+        const ids = this.returnedIds(data);
+        if (error || ids.length !== chunk.length) {
+          const reason = error
+            ? errorMessage(error)
+            : 'Insert returned no data: access denied';
+          chunk.forEach((c) =>
+            failed.push({ op: 'insert', index: c.index, error: reason })
+          );
+          return;
+        }
+        // PostgREST returns inserted rows in input order
+        chunk.forEach((c, i) => insertedByIndex.set(c.index, ids[i]!));
+      });
+    }
 
+    // 5. Updates — group ids by identical (mapped) patch.
+    const groups = new Map<
+      string,
+      { patch: Record<string, unknown>; ids: string[] }
+    >();
+    for (const { id, patch } of updates) {
+      const mapped = this.mapper.toBackendKeys(
+        stripTimestampFields({
+          ...patch,
+          updatedById: userId,
+        })
+      );
+      const key = JSON.stringify(mapped);
+      const group = groups.get(key);
+      if (group) group.ids.push(id);
+      else groups.set(key, { patch: mapped, ids: [id] });
+    }
+    const updated = new Set<string>();
+    for (const { patch, ids } of groups.values()) {
+      for (const chunk of chunked(ids, BULK_CHUNK_SIZE)) {
+        tasks.push(async () => {
+          const { data, error } = await this.client
+            .from(collection)
+            .update(patch)
+            .in(this.idColumn, chunk)
+            .select(this.idColumn)
+            .then(
+              (res) => res,
+              (thrown: unknown) => ({ data: null, error: thrown })
+            );
+          this.collectWritten('update', chunk, data, error, updated, failed);
+        });
+      }
+    }
+
+    // 6. Deletes.
+    const deleted = new Set<string>();
+    for (const chunk of chunked(deletes, BULK_CHUNK_SIZE)) {
+      tasks.push(async () => {
+        const { data, error } = await this.client
+          .from(collection)
+          .delete()
+          .in(this.idColumn, chunk)
+          .select(this.idColumn)
+          .then(
+            (res) => res,
+            (thrown: unknown) => ({ data: null, error: thrown })
+          );
+        this.collectWritten('delete', chunk, data, error, deleted, failed);
+      });
+    }
+
+    await runConcurrently(tasks, BULK_CONCURRENCY);
+
+    return {
+      insertedIds: inserts
+        .map((_, index) => insertedByIndex.get(index))
+        .filter((id): id is string => id !== undefined),
+      updatedIds: updates.map((u) => u.id).filter((id) => updated.has(id)),
+      deletedIds: deletes.filter((id) => deleted.has(id)),
+      failed,
+    };
+  }
+
+  /**
+   * Record which ids an update/delete chunk actually wrote. Ids the write did not
+   * return (RLS skipped them, or they do not exist) and ids of a failed request
+   * are added to `failed`.
+   */
+  private collectWritten(
+    op: 'update' | 'delete',
+    ids: string[],
+    data: unknown,
+    error: unknown,
+    written: Set<string>,
+    failed: BulkFailure[]
+  ): void {
     if (error) {
+      const reason = errorMessage(error);
+      ids.forEach((id) => failed.push({ op, id, error: reason }));
+      return;
+    }
+    const returned = new Set(this.returnedIds(data));
+    const label = op === 'update' ? 'Update' : 'Delete';
+    for (const id of ids) {
+      if (returned.has(id)) written.add(id);
+      else
+        failed.push({
+          op,
+          id,
+          error: `${label} affected 0 rows: entity not found or access denied`,
+        });
+    }
+  }
+
+  /** Ids of the rows a write returned (`.select(idColumn)`), in returned order. */
+  private returnedIds(data: unknown): string[] {
+    // Validated, not cast: a malformed PostgREST response fails loud
+    const rows = v.parse(RETURNED_ROWS_SCHEMA, data) ?? [];
+    return rows.map((row) => String(v.parse(ROW_ID_SCHEMA, row[this.idColumn])));
+  }
+
+  /** Authenticated user id, or a wrapped error (no session: nothing is written). */
+  private async requireSessionUserId(
+    operation: string,
+    collection: string
+  ): Promise<string> {
+    let userId: string | undefined;
+    try {
+      const { data: sessionData } = await this.client.auth.getSession();
+      userId = sessionData?.session?.user?.id;
+    } catch (err) {
       throw wrapCrudError(
-        error instanceof Error ? error : new Error(String(error)),
+        err instanceof Error ? err : new Error(String(err)),
         'SupabaseCrudAdapter',
-        'bulk',
+        operation,
         collection
       );
     }
-
-    // 6. Validate response on the wire. Malformed shape → fail loud.
-    const parsedResponse = v.safeParse(BulkResponseSchema, result);
-    if (!parsedResponse.success) {
+    if (!userId) {
       throw wrapCrudError(
-        new Error(
-          `SupabaseCrudAdapter.bulk: malformed response — ${parsedResponse.issues
-            .map((i) => i.message)
-            .join('; ')}`
-        ),
+        new Error('Authentication required for this operation'),
         'SupabaseCrudAdapter',
-        'bulk',
+        operation,
         collection
       );
     }
-
-    return parsedResponse.output;
+    return userId;
   }
 
   async query<T>(
@@ -828,11 +1048,15 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
     }
     const queryRole = schema ? await this.getUserRole() : null;
     const selectCols =
-      schema && queryRole ? this.buildSelectColumns(schema, queryRole) : '*';
+      schema && queryRole
+        ? this.buildSelectColumns(collection, schema, queryRole)
+        : '*';
 
-    let q: SbFilterBuilder = this.asRequester(
-      this.client.from(collection).select(selectCols, { count: 'exact' })
-    ) as unknown as SbFilterBuilder;
+    let q = toFilterBuilder(
+      this.asRequester(
+        this.client.from(collection).select(selectCols, { count: 'exact' })
+      )
+    );
 
     const toBackendField = (appField: string) =>
       this.mapper.toBackendField(appField);
@@ -867,19 +1091,20 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
     let totalCount: number | undefined;
     if (cursor) {
       // Separate count query: same where/order filters but NO cursor filter
-      let countQ: SbFilterBuilder = this.asRequester(
-        this.client.from(collection).select(selectCols, {
-          count: 'exact',
-          head: true,
-        })
-      ) as unknown as SbFilterBuilder;
+      let countQ = toFilterBuilder(
+        this.asRequester(
+          this.client.from(collection).select(selectCols, {
+            count: 'exact',
+            head: true,
+          })
+        )
+      );
       if (options.where) {
         for (const clause of options.where) {
           countQ = applyWhere(countQ, clause, toBackendField);
         }
       }
-      const countResult = await countQ;
-      const { count: totalFromCount } = countResult as { count?: number };
+      const { count: totalFromCount } = await countQ;
       totalCount = totalFromCount ?? undefined;
 
       if (orderDirection === 'asc') {
@@ -891,25 +1116,30 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
 
     q = q.limit(limit + 1);
 
-    const result = await q;
-    const { data, error, count } = result as {
-      data: Record<string, unknown>[] | null;
-      error: { message?: string; code?: string; details?: string } | null;
-      count?: number;
-    };
+    const { data, error, count } = await q;
 
     if (error) {
+      if (this.noteMissingTranslationColumn(collection, error))
+        return this.query<T>(
+          collection,
+          options,
+          schema,
+          _schemaType,
+          operationOptions
+        );
+      const message =
+        typeof error === 'object' && 'message' in error ? error.message : '';
       throw wrapCrudError(
         error instanceof Error
           ? error
-          : new Error(error.message || String(error)),
+          : new Error((typeof message === 'string' && message) || String(error)),
         'SupabaseCrudAdapter',
         'query',
         collection
       );
     }
 
-    const rows = (data ?? []) as Record<string, unknown>[];
+    const rows = v.parse(QUERY_ROWS_SCHEMA, data) ?? [];
     const hasMore = rows.length > limit;
     const items = hasMore ? rows.slice(0, limit) : rows;
     const lastRow = items[items.length - 1];
@@ -935,9 +1165,9 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
       const normalized = entityMapper.fromBackendRow(withId);
       const filtered =
         schema && role
-          ? filterVisibleFields(normalized as Record<string, any>, schema, role)
+          ? filterVisibleFields(normalized, schema, role)
           : normalized;
-      resultItems.push({ ...filtered, id: docId } as T);
+      resultItems.push(asEntity<T>({ ...filtered, id: docId }));
     }
 
     return {
@@ -987,26 +1217,22 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
             this.getUserRole().then(
               (role) => {
                 const normalized = entityMapper.fromBackendRow(withId);
-                const filtered = filterVisibleFields(
-                  normalized as Record<string, any>,
-                  schema,
-                  role
-                );
-                callback({ ...filtered, id } as T);
+                const filtered = filterVisibleFields(normalized, schema, role);
+                callback(asEntity<T>({ ...filtered, id }));
               },
               () => {
                 const normalized = entityMapper.fromBackendRow(withId);
                 const filtered = filterVisibleFields(
-                  normalized as Record<string, any>,
+                  normalized,
                   schema,
-                  'guest' as UserRole
+                  'guest'
                 );
-                callback({ ...filtered, id } as T);
+                callback(asEntity<T>({ ...filtered, id }));
               }
             );
           } else {
             const normalized = entityMapper.fromBackendRow(withId);
-            callback({ ...normalized, id } as T);
+            callback(asEntity<T>({ ...normalized, id }));
           }
         }
       )
