@@ -17,6 +17,7 @@ import * as v from 'valibot';
 import { stringFromBase64URL } from '@supabase/ssr';
 
 import type { AuthSessionSnapshot, AuthUser } from '@donotdev/core';
+import { getRoleFromClaims, resolveUserSubscription } from '@donotdev/core';
 
 /** Prefix @supabase/ssr puts on base64url-encoded cookie values. */
 const SESSION_COOKIE_BASE64_PREFIX = 'base64-';
@@ -62,7 +63,7 @@ function metaString(
   return typeof value === 'string' ? value : undefined;
 }
 
-/** Map a Supabase user to the framework AuthUser. */
+/** Map a Supabase user to AuthUser; trusted app metadata owns claims/roles (default user). */
 export function mapSupabaseUserToAuthUser(user: MappableSupabaseUser): AuthUser {
   const meta = user.user_metadata ?? {};
   const appMeta = user.app_metadata ?? {};
@@ -72,8 +73,8 @@ export function mapSupabaseUserToAuthUser(user: MappableSupabaseUser): AuthUser 
     displayName: metaString(meta, 'full_name') ?? metaString(meta, 'name'),
     photoURL: metaString(meta, 'avatar_url'),
     emailVerified: !!user.email_confirmed_at,
-    role: metaString(appMeta, 'role') ?? 'guest',
-    customClaims: { ...meta, ...appMeta },
+    role: getRoleFromClaims(appMeta),
+    customClaims: { ...appMeta },
   };
 }
 
@@ -89,7 +90,7 @@ export function mapSupabaseUserToAuthUser(user: MappableSupabaseUser): AuthUser 
  * Behind the generated proxy the render always gets a refreshed, valid cookie.
  *
  * @param cookieHeader - The request's `Cookie` header
- * @returns `{ user: null }` signed out, `{ user, accessToken? }` signed in with an
+ * @returns `{ user: null }` signed out, `{ user, userSubscription, accessToken? }` signed in with an
  * unexpired access token, `null` cannot tell (expired or undated session, several
  * projects' cookies, partially written cookie)
  *
@@ -153,12 +154,16 @@ export function readSupabaseSessionCookie(
       return null;
     }
     const user = mapSupabaseUserToAuthUser(session.user);
+    const userSubscription = resolveUserSubscription(
+      user.id,
+      user.customClaims?.subscription
+    );
     // Token for request-scoped reads during the server render, only while it stays
     // valid for the render (a minute of margin); an expiring one would just be refused.
     return typeof session.access_token === 'string' &&
       session.expires_at * 1000 > Date.now() + 60_000
-      ? { user, accessToken: session.access_token }
-      : { user };
+      ? { user, userSubscription, accessToken: session.access_token }
+      : { user, userSubscription };
   } catch {
     // Partially written or foreign cookie: let the provider decide once ready.
     return null;

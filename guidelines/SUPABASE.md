@@ -74,6 +74,65 @@ Go to the Supabase Dashboard and configure:
 
 ---
 
+## Auth Claims and Access Subscriptions
+
+Authorization uses trusted `app_metadata` only (`raw_app_meta_data` in SQL). Editable `user_metadata` supplies profile name/avatar, not roles or grants. A signed-in user without an explicit application role defaults to `user`.
+
+Auth owns the canonical `SubscriptionClaimsSchema` in core, independently of billing. Store access at `app_metadata.subscription`, exposed as `AuthUser.customClaims.subscription`. Required: `tier`, `status`, `subscriptionEnd` (ISO timestamp or null), `updatedAt` (ISO timestamp). `features` and `isDefault` are optional. Optional nullable `subscriptionId` / `customerId` and optional `cancelAtPeriodEnd` are deprecated billing projections; never fabricate them for generic access.
+
+### Server-only grant / revoke
+
+The caller must authenticate and authorize the actor for the target `uid` before invoking this helper. The server secret must never reach a browser or an unguarded endpoint.
+
+```typescript
+import * as v from 'valibot';
+import { SubscriptionClaimsSchema } from '@donotdev/core/server';
+import {
+  createServerClient,
+  SupabaseServerAuthAdapter,
+} from '@donotdev/supabase/server';
+
+async function writeAccess(
+  url: string,
+  serverSecret: string,
+  uid: string,
+  tier: 'pro' | 'free',
+): Promise<void> {
+  await new SupabaseServerAuthAdapter(createServerClient(url, serverSecret))
+    .setCustomClaims(uid, {
+      subscription: v.parse(SubscriptionClaimsSchema, {
+        tier,
+        status: 'active',
+        subscriptionEnd: null,
+        updatedAt: new Date().toISOString(),
+      }),
+    });
+}
+```
+
+Use `pro` to grant, `free` to revoke. `setCustomClaims` merges top-level app metadata, preserving unrelated keys; send the **complete** nested subscription. Omitting the key leaves the grant intact. `{ subscription: null }` explicitly clears its value under merge and resolves to free; prefer a complete free object without billing IDs. Self-service claims functions block subscription updates.
+
+After the write, explicitly sync the affected browser:
+
+```typescript
+import { getProvider } from '@donotdev/core';
+
+const token = await getProvider('auth').refreshToken();
+if (token === null) throw new Error('Auth refresh failed');
+```
+
+The existing provider method applies canonical auth state before successful resolution; there is no `useAuth` refresh selector. A server setter cannot remotely force another user's browser to refresh.
+
+Absent/null subscription resolves to deterministic free. Malformed present claims fail/deny, not silently retain access; a flat `app_metadata.tier` is not a migration fallback. Tier guards/provider `hasTier()` are hierarchical and status-blind: they compare the declared tier, not `isActive` or expiry. Unknown/unconfigured tiers deny. `isActive` checks only `status === 'active'`; `subscriptionEnd` is not auto-enforced. Existing legacy/custom status strings remain accepted. Revoke by lowering/removing tier, not by changing status alone.
+
+### Next proxy, SSR and revocation limits
+
+With cookie sessions, the generated page proxy calls Auth `getUser()` on every authenticated page request (network latency), refreshes expired tokens as needed, and forwards cookies whose user/claims are bound to that verified result. On outage it removes unverified render identity from the forwarded request while retaining browser cookies. Never globally cache personal auth.
+
+`AuthSessionSnapshot.userSubscription` supplies display-only request-local context during initialization; never seed singleton auth identity from SSR. Protected server operations require fresh trusted authorization. `getUser()` verification does **not** guarantee JWT revocation everywhere: direct RLS using `auth.jwt()` can see stale claims until token refresh/expiry. Immediate revocation requires an authoritative policy at the protected server/database operation; a page guard or browser refresh alone is insufficient.
+
+---
+
 ## Edge Functions
 
 Supabase Edge Functions run on Deno at the edge. If you selected functions during scaffolding, they're in `supabase/functions/`.
@@ -110,7 +169,9 @@ const result = await crudAdapter.bulk('products', {
 - Session required (nothing written without one); `createdById` / `updatedById` stamped; timestamps left to the DB; camelCase → snake_case mapping as for single-row writes.
 - Id collisions (same id in `updates` + `deletes`, or `inserts` + `updates`) reject up-front with `BulkCollisionError` before any write. Empty bulk (`{}`) is a no-op.
 
-Server side, `createSupabaseCrudFunctions` still registers a `bulk_${collection}` edge handler (transactional, `crud_bulk` RPC migration) for server code that needs one transaction; the client adapter does not use it.
+Server side, `createSupabaseCrudFunctions` still registers a `bulk_${collection}` edge handler (transactional, `crud_bulk` RPC migration) for server code that needs one transaction; the client adapter does not use it. The handler reads the stored status of each updated row before the RPC (it picks the patch's schema) and passes it as `p_expected_statuses`; `crud_bulk` locks the rows and rejects the whole bulk (`unavailable`, nothing written) when a status changed in between. Needs migration `20250101000006_crud_bulk_status_guard.sql` (5-argument `crud_bulk`, also fixes updates/deletes on `uuid` ids); apps created before it copy it from `packages/cli/templates/functions-supabase/supabase/migrations/`.
+
+Edge Function rate limiting (`createSupabaseHandler`) calls the `public.rate_limit_check` RPC: migration `20250101000007_rate_limit_check.sql` (service_role only). Without it the limiter fails closed and every Edge Function call answers 429; apps created before it copy it from the same templates folder.
 
 ### Custom Functions (typed)
 
@@ -218,7 +279,7 @@ You never set timestamps in app code - the DB owns them.
 | `VITE_SUPABASE_URL` | Project URL (public) |
 | `VITE_SUPABASE_PUBLIC_KEY` | Public key (safe in bundle) |
 
-**Client (Next.js):** `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_PUBLIC_KEY`. With `createBrowserClient` the generated `src/proxy.next.ts` reads them too: it refreshes the session on every page request (`refreshSupabaseSession` from `@donotdev/supabase/server`) and throws without them.
+**Client (Next.js):** `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_PUBLIC_KEY`. With `createBrowserClient` the generated `src/proxy.next.ts` reads them too: it verifies authenticated page requests with `getUser()` and refreshes expired sessions as needed (`refreshSupabaseSession` from `@donotdev/supabase/server`). It throws without these env vars.
 
 **Server (Edge Functions, API routes):** use the same URL and `SUPABASE_SECRET_KEY` for admin operations. Never expose the service_role key to the client. Put it in `.dndev.secrets` at project root (or your host's env for production).
 

@@ -11,24 +11,11 @@ import { describe, it, expect, vi } from 'vitest';
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
-import { createSchemas, defineEntity } from '@donotdev/core';
+import { createSchemas } from '@donotdev/core';
 
 import { SupabaseCrudAdapter } from '../common/crudAdapter';
+import { translatedDescriptionEntity as product } from '@dndev/test-entities';
 
-const product = defineEntity({
-  name: 'Product',
-  collection: 'products',
-  fields: {
-    title: { name: 'title', label: 'Title', type: 'text', visibility: 'guest' },
-    description: {
-      name: 'description',
-      label: 'Description',
-      type: 'textarea',
-      visibility: 'guest',
-      i18n: true,
-    },
-  },
-});
 const getSchema = createSchemas(product).get;
 
 const ROW = { id: 'p1', status: 'available', title: 'Crème', description: 'Texte' };
@@ -41,7 +28,7 @@ function client(tableColumns: string[]) {
     return missing
       ? {
           data: null,
-          error: { code: '42703', message: `column products.${missing} does not exist` },
+          error: { code: '42703', message: `column translated_descriptions.${missing} does not exist` },
           count: null,
         }
       : { data: [ROW], error: null, count: 1 };
@@ -79,7 +66,7 @@ describe('SupabaseCrudAdapter — translation column not migrated yet', () => {
     const fake = client(['id', 'status', 'title', 'description']);
     const adapter = new SupabaseCrudAdapter(fake.client);
 
-    const doc = await adapter.get<Record<string, unknown>>('products', 'p1', getSchema);
+    const doc = await adapter.get<Record<string, unknown>>('translated_descriptions', 'p1', getSchema);
 
     expect(doc).toMatchObject({ id: 'p1', description: 'Texte' });
     expect(fake.selects[0]).toContain('description_i18n');
@@ -93,8 +80,8 @@ describe('SupabaseCrudAdapter — translation column not migrated yet', () => {
     const fake = client(['id', 'status', 'title', 'description']);
     const adapter = new SupabaseCrudAdapter(fake.client);
 
-    const first = await adapter.query('products', {}, getSchema);
-    const second = await adapter.query('products', {}, getSchema);
+    const first = await adapter.query('translated_descriptions', {}, getSchema);
+    const second = await adapter.query('translated_descriptions', {}, getSchema);
 
     expect(first.items).toHaveLength(1);
     expect(second.items).toHaveLength(1);
@@ -107,7 +94,7 @@ describe('SupabaseCrudAdapter — translation column not migrated yet', () => {
     const fake = client(['id', 'status', 'title', 'description', 'description_i18n']);
     const adapter = new SupabaseCrudAdapter(fake.client);
 
-    await adapter.get('products', 'p1', getSchema);
+    await adapter.get('translated_descriptions', 'p1', getSchema);
 
     expect(fake.selects).toHaveLength(1);
     expect(fake.selects[0]).toContain('description_i18n');
@@ -117,6 +104,6 @@ describe('SupabaseCrudAdapter — translation column not migrated yet', () => {
     const fake = client(['id', 'status', 'description', 'description_i18n']);
     const adapter = new SupabaseCrudAdapter(fake.client);
 
-    await expect(adapter.get('products', 'p1', getSchema)).rejects.toThrow();
+    await expect(adapter.get('translated_descriptions', 'p1', getSchema)).rejects.toThrow();
   });
 });

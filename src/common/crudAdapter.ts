@@ -62,6 +62,8 @@ import type {
 } from '@donotdev/core';
 import type { UserRole } from '@donotdev/core';
 
+import { mapCheckViolation } from './checkConstraints';
+import type { CheckViolation } from './checkConstraints';
 import {
   createEntityAwareMapper,
   defaultFieldMapper,
@@ -424,14 +426,83 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
   }
 
   /**
+   * Error of a failed single-row write. A Postgres `23514` violation of a generated
+   * CHECK constraint (`<table>_<column>_<rule>`) becomes a `validation-failed`
+   * error naming the entity field and the i18n key of the client message
+   * (`details: { field, rule, constraint, i18nKey }`); anything else is wrapped as usual.
+   */
+  private writeError(
+    error: unknown,
+    operation: 'add' | 'set' | 'update',
+    collection: string,
+    schema?: dndevSchema<unknown>,
+    id?: string
+  ): DoNotDevError {
+    const violation = this.checkViolation(error, collection, schema);
+    if (!violation) {
+      return wrapCrudError(error, 'SupabaseCrudAdapter', operation, collection, id);
+    }
+    return new DoNotDevError('Validation failed.', ERROR_CODES.VALIDATION_FAILED, {
+      source: 'validation',
+      details: {
+        field: violation.field,
+        rule: violation.rule,
+        constraint: violation.constraint,
+        i18nKey: violation.i18nKey,
+        context: `SupabaseCrudAdapter.${operation}(${collection}${id ? `, ${id}` : ''})`,
+      },
+    });
+  }
+
+  /**
+   * A Postgres `23514` violation of a generated CHECK constraint of `collection`,
+   * mapped to its entity field (`null` for any other error).
+   */
+  private checkViolation(
+    error: unknown,
+    collection: string,
+    schema?: dndevSchema<unknown>
+  ): CheckViolation | null {
+    const mapper = this.createEntityMapper(schema);
+    // One column in, one field name out (the mapper maps every key)
+    return mapCheckViolation(
+      error,
+      collection,
+      (column) => Object.keys(mapper.fromBackendRow({ [column]: null }))[0]!
+    );
+  }
+
+  /**
+   * A bulk row that was not written because of `error`: a generated CHECK violation
+   * also names the entity field and the i18n key of the client message.
+   */
+  private bulkFailure(
+    failure: Omit<BulkFailure, 'error' | 'field' | 'i18nKey'>,
+    error: unknown,
+    collection: string,
+    schema?: dndevSchema<unknown>
+  ): BulkFailure {
+    const violation = this.checkViolation(error, collection, schema);
+    return violation
+      ? { ...failure, error: errorMessage(error), field: violation.field, i18nKey: violation.i18nKey }
+      : { ...failure, error: errorMessage(error) };
+  }
+
+  /**
    * Build an entity-aware mapper when schema is available.
    * Returns entity field names from `fromBackendRow` so `filterVisibleFields` can match them.
+   * No schema → default mapper. A schema without object entries throws.
    */
   private createEntityMapper(
     schema?: dndevSchema<unknown>
   ): typeof defaultFieldMapper {
+    if (!schema) return this.mapper;
     const fieldNames = getEntityFieldNames(schema);
-    if (fieldNames.length === 0) return this.mapper;
+    if (fieldNames.length === 0) {
+      throw new Error(
+        'SupabaseCrudAdapter: schema has no object entries, so rows cannot be mapped back to entity field names. Pass the object schema generated for the entity.'
+      );
+    }
     return createEntityAwareMapper(fieldNames);
   }
 
@@ -508,6 +579,31 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
       `[SupabaseCrudAdapter] ${collection}.${column} does not exist: serving the default language for that field. Apply the migration that adds it.`
     );
     return true;
+  }
+
+  /**
+   * A written row as `get` returns it: entity keys, filtered with the collection's
+   * read schema for the requester's role (no schema: every returned column).
+   */
+  private async storedRow(
+    raw: unknown,
+    readSchema: dndevSchema<unknown> | undefined
+  ): Promise<Record<string, unknown>> {
+    const record = v.parse(ROW_SCHEMA, raw);
+    const id = String(record[this.idColumn]);
+    const normalized = this.createEntityMapper(readSchema).fromBackendRow({ ...record, id });
+    if (!readSchema) return { ...normalized, id };
+    const role = await this.getUserRole();
+    return { ...filterVisibleFields(normalized, readSchema, role), id };
+  }
+
+  /** Columns a write returns: the requester's readable columns of the read schema (as `get` selects). */
+  private async writeSelect(
+    collection: string,
+    readSchema: dndevSchema<unknown> | undefined
+  ): Promise<string> {
+    if (!readSchema) return '*';
+    return this.buildSelectColumns(collection, readSchema, await this.getUserRole());
   }
 
   async get<T>(
@@ -597,11 +693,15 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
     const { data: inserted, error } = await this.client
       .from(collection)
       .insert(insertPayload)
-      .select()
+      .select(await this.writeSelect(collection, options?.readSchema))
       .single();
 
-    if (error)
-      throw wrapCrudError(error, 'SupabaseCrudAdapter', 'add', collection);
+    if (error) {
+      // A translation column not migrated yet: the insert did not run, retry without it.
+      if (this.noteMissingTranslationColumn(collection, error))
+        return this.add<T>(collection, data, schema, options);
+      throw this.writeError(error, 'add', collection, schema);
+    }
     if (!inserted)
       throw wrapCrudError(
         new Error('Insert returned no data'),
@@ -610,10 +710,8 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
         collection
       );
 
-    const insertedRow = v.parse(ROW_SCHEMA, inserted);
-    const id = String(insertedRow[this.idColumn] ?? '');
-    const out = this.mapper.fromBackendRow({ ...insertedRow, id });
-    return { id, data: out };
+    const out = await this.storedRow(inserted, options?.readSchema);
+    return { id: String(out.id), data: out };
   }
 
   async set<T>(
@@ -622,7 +720,7 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
     data: T,
     schema?: dndevSchema<T>,
     options?: CrudOperationOptions
-  ): Promise<void> {
+  ): Promise<Record<string, unknown>> {
     if (options?.signal?.aborted) {
       throw new Error('Operation cancelled');
     }
@@ -662,10 +760,14 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
       .upsert(this.mapper.toBackendKeys(payload), {
         onConflict: this.idColumn,
       })
-      .select(this.idColumn);
+      .select(await this.writeSelect(collection, options?.readSchema));
 
-    if (error)
-      throw wrapCrudError(error, 'SupabaseCrudAdapter', 'set', collection, id);
+    if (error) {
+      // A translation column not migrated yet: the upsert did not run, retry without it.
+      if (this.noteMissingTranslationColumn(collection, error))
+        return this.set<T>(collection, id, data, schema, options);
+      throw this.writeError(error, 'set', collection, schema, id);
+    }
 
     if (!upserted || upserted.length === 0) {
       throw wrapCrudError(
@@ -676,6 +778,7 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
         id
       );
     }
+    return this.storedRow(upserted[0], options?.readSchema);
   }
 
   async update<T>(
@@ -683,7 +786,7 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
     id: string,
     data: Partial<T>,
     options?: CrudOperationOptions
-  ): Promise<void> {
+  ): Promise<Record<string, unknown>> {
     if (options?.signal?.aborted) {
       throw new Error('Operation cancelled');
     }
@@ -719,16 +822,14 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
       .from(collection)
       .update(this.mapper.toBackendKeys(payload))
       .eq(this.idColumn, id)
-      .select(this.idColumn);
+      .select(await this.writeSelect(collection, options?.readSchema));
 
-    if (error)
-      throw wrapCrudError(
-        error,
-        'SupabaseCrudAdapter',
-        'update',
-        collection,
-        id
-      );
+    if (error) {
+      // A translation column not migrated yet: the update did not run, retry without it.
+      if (this.noteMissingTranslationColumn(collection, error))
+        return this.update<T>(collection, id, data, options);
+      throw this.writeError(error, 'update', collection, undefined, id);
+    }
 
     if (!updated || updated.length === 0) {
       throw wrapCrudError(
@@ -739,6 +840,7 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
         id
       );
     }
+    return this.storedRow(updated[0], options?.readSchema);
   }
 
   async delete(
@@ -892,12 +994,15 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
             (thrown: unknown) => ({ data: null, error: thrown })
           );
         const ids = this.returnedIds(data);
-        if (error || ids.length !== chunk.length) {
-          const reason = error
-            ? errorMessage(error)
-            : 'Insert returned no data: access denied';
+        if (error) {
           chunk.forEach((c) =>
-            failed.push({ op: 'insert', index: c.index, error: reason })
+            failed.push(this.bulkFailure({ op: 'insert', index: c.index }, error, collection, schema))
+          );
+          return;
+        }
+        if (ids.length !== chunk.length) {
+          chunk.forEach((c) =>
+            failed.push({ op: 'insert', index: c.index, error: 'Insert returned no data: access denied' })
           );
           return;
         }
@@ -936,7 +1041,7 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
               (res) => res,
               (thrown: unknown) => ({ data: null, error: thrown })
             );
-          this.collectWritten('update', chunk, data, error, updated, failed);
+          this.collectWritten('update', chunk, data, error, updated, failed, collection, schema);
         });
       }
     }
@@ -954,7 +1059,7 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
             (res) => res,
             (thrown: unknown) => ({ data: null, error: thrown })
           );
-        this.collectWritten('delete', chunk, data, error, deleted, failed);
+        this.collectWritten('delete', chunk, data, error, deleted, failed, collection, schema);
       });
     }
 
@@ -973,7 +1078,7 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
   /**
    * Record which ids an update/delete chunk actually wrote. Ids the write did not
    * return (RLS skipped them, or they do not exist) and ids of a failed request
-   * are added to `failed`.
+   * are added to `failed` (a CHECK violation with its field and i18n key).
    */
   private collectWritten(
     op: 'update' | 'delete',
@@ -981,11 +1086,12 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
     data: unknown,
     error: unknown,
     written: Set<string>,
-    failed: BulkFailure[]
+    failed: BulkFailure[],
+    collection: string,
+    schema?: dndevSchema<unknown>
   ): void {
     if (error) {
-      const reason = errorMessage(error);
-      ids.forEach((id) => failed.push({ op, id, error: reason }));
+      ids.forEach((id) => failed.push(this.bulkFailure({ op, id }, error, collection, schema)));
       return;
     }
     const returned = new Set(this.returnedIds(data));

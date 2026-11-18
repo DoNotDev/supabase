@@ -1,6 +1,6 @@
 {
   "name": "@donotdev/supabase",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "private": false,
   "type": "module",
   "license": "MIT",
@@ -17,6 +17,11 @@
       "types": "./src/server/index.ts",
       "import": "./src/server/index.ts",
       "default": "./src/server/index.ts"
+    },
+    "./checks": {
+      "types": "./src/common/checkConstraints.ts",
+      "import": "./src/common/checkConstraints.ts",
+      "default": "./src/common/checkConstraints.ts"
     }
   },
   "scripts": {
@@ -32,7 +37,7 @@
     "valibot": "^1.5.0"
   },
   "peerDependencies": {
-    "@donotdev/core": "^0.2.3"
+    "@donotdev/core": "^0.3.0"
   },
   "peerDependenciesMeta": {},
   "devDependencies": {

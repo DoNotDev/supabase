@@ -49,7 +49,7 @@ describe('SupabaseCrudAdapter.forAccessToken', () => {
     const { client, getSession } = fakeClient();
     const view = new SupabaseCrudAdapter(client).forAccessToken(jwt({ app_metadata: { role: 'admin' } }));
     // getUserRole is private: its effect is that no session lookup happens.
-    await view.query('brands', {}, { entries: {} } as never);
+    await view.query('brands', {}, { entries: { name: {} } } as never);
     expect(getSession).not.toHaveBeenCalled();
   });
 

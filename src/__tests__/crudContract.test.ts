@@ -183,17 +183,17 @@ describe('SupabaseCrudAdapter — ICrudAdapter contract', () => {
     expect(result.data).toBeDefined();
   });
 
-  it('set() resolves without error', async () => {
+  it('set() resolves with the returned row', async () => {
     await expect(
       adapter.set<{ name: string }>('users', 'u1', { name: 'Alice' })
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ id: 'u1' });
     expect(client.from).toHaveBeenCalledWith('users');
   });
 
-  it('update() resolves without error', async () => {
+  it('update() resolves with the returned row', async () => {
     await expect(
       adapter.update<{ name: string }>('users', 'u1', { name: 'Updated' })
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ id: 'u1' });
   });
 
   it('delete() resolves without error', async () => {

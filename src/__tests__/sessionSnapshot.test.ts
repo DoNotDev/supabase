@@ -11,6 +11,7 @@ import { stringToBase64URL } from '@supabase/ssr';
 
 import { SupabaseAuth } from '../client/auth';
 import { createBrowserClient } from '../client/browserClient';
+import { mapSupabaseUserToAuthUser } from '../common/sessionCookie';
 
 const KEY = 'sb-abcdref-auth-token';
 const session = {
@@ -31,7 +32,40 @@ function cookieAuth() {
   return new SupabaseAuth(createBrowserClient('https://abcdref.supabase.co', 'key'));
 }
 
+describe('mapSupabaseUserToAuthUser role', () => {
+  it.each([undefined, null, {}])(
+    'defaults an authenticated user to user with app_metadata %s',
+    (appMetadata) => {
+      expect(
+        mapSupabaseUserToAuthUser({ id: 'u1', app_metadata: appMetadata }).role
+      ).toBe('user');
+    }
+  );
+
+  it('does not take the application role from editable user metadata', () => {
+    expect(
+      mapSupabaseUserToAuthUser({
+        id: 'u1',
+        user_metadata: { role: 'admin' },
+      }).role
+    ).toBe('user');
+  });
+
+  it.each(['guest', 'user', 'admin', 'super'])('preserves explicit application role %s', (role) => {
+    expect(
+      mapSupabaseUserToAuthUser({ id: 'u1', app_metadata: { role } }).role
+    ).toBe(role);
+  });
+});
+
 describe('SupabaseAuth.readSessionSnapshot', () => {
+  it('maps an authenticated cookie without an application role to user', () => {
+    const header = `${KEY}=${encodeURIComponent(JSON.stringify({
+      ...session,
+      user: { ...session.user, app_metadata: {} },
+    }))}`;
+    expect(cookieAuth().readSessionSnapshot(header)?.user?.role).toBe('user');
+  });
   it('reads the signed-in user from a whole session cookie', () => {
     const snapshot = cookieAuth().readSessionSnapshot(
       `dndev-lang=fr; ${KEY}=${encodeURIComponent(encoded)}`

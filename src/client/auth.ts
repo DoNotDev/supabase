@@ -35,7 +35,8 @@ import {
   getProvider,
   getAuthMethod,
   createDefaultUserProfile,
-  SUBSCRIPTION_TIERS,
+  resolveUserSubscription,
+  hasTierAccess,
   hasRoleAccess,
   wrapAuthError,
   DoNotDevError,
@@ -101,6 +102,8 @@ function toOAuthProvider(partnerId: AuthPartnerId): OAuthProvider {
 export class SupabaseAuth implements AuthProvider {
   private store: (AuthState & AuthActions) | null = null;
   private initialized = false;
+  private authGeneration = 0;
+  private authIdentity: string | null | undefined;
   /** Optional security context — injected via setSecurity() */
   private security: SecurityContext | null = null;
   /**
@@ -187,6 +190,7 @@ export class SupabaseAuth implements AuthProvider {
   async initialize(): Promise<void> {
     if (this.initialized) return;
 
+    const generation = this.authGeneration;
     try {
       // NOTE: getSession() reads from local storage only (no server validation).
       // For security-sensitive flows, use getUser() which validates with the server.
@@ -194,6 +198,8 @@ export class SupabaseAuth implements AuthProvider {
       // write operations are protected by RLS on the server.
       const { data } = await this.client.auth.getSession();
 
+      if (generation !== this.authGeneration) return;
+      this.authIdentity = data.session?.user.id ?? null;
       // Update store with initial session
       if (data.session?.user) {
         await this.handleAuthStateChange(data.session.user);
@@ -204,14 +210,17 @@ export class SupabaseAuth implements AuthProvider {
       this.initialized = true;
     } catch (error) {
       console.error('[SupabaseAuth] Initialization failed:', error);
-      this.store?.setUnauthenticated();
+      if (generation === this.authGeneration) this.store?.setUnauthenticated();
     }
   }
 
   async getCurrentUser(): Promise<AuthUser | null> {
+    const generation = this.authGeneration;
     const {
       data: { user },
     } = await this.client.auth.getUser();
+    if (generation !== this.authGeneration) return null;
+    if (this.authIdentity !== undefined && (user?.id ?? null) !== this.authIdentity) return null;
     return user ? mapSupabaseUserToAuthUser(user) : null;
   }
 
@@ -226,23 +235,13 @@ export class SupabaseAuth implements AuthProvider {
 
     const user = mapSupabaseUserToAuthUser(supabaseUser);
 
-    // Create default subscription (Supabase doesn't have native subscription object like we do)
-    // In a real app, you might fetch this from a 'subscriptions' table
-    const subscription: UserSubscription = {
-      userId: user.id,
-      tier:
-        (typeof user.customClaims?.tier === 'string' &&
-          user.customClaims.tier) ||
-        SUBSCRIPTION_TIERS.FREE,
-      status: 'active',
-      isActive: true,
-      features: [],
-      subscriptionId: null,
-      customerId: user.id,
-      subscriptionEnd: null,
-      cancelAtPeriodEnd: false,
-      updatedAt: new Date().toISOString(),
-    };
+    let subscription: UserSubscription;
+    try {
+      subscription = resolveUserSubscription(user.id, user.customClaims?.subscription);
+    } catch (error) {
+      this.store.setUnauthenticated();
+      throw error;
+    }
 
     // Create user profile (coerce null to undefined for UserProfile)
     const profile: UserProfile = {
@@ -370,6 +369,7 @@ export class SupabaseAuth implements AuthProvider {
   }
 
   async signOut(): Promise<void> {
+    ++this.authGeneration;
     // Resolve userId BEFORE calling signOut, but never let getUser() failure
     // prevent the actual sign-out — that would leave the session active.
     let userId: string | undefined;
@@ -496,12 +496,20 @@ export class SupabaseAuth implements AuthProvider {
   }
 
   async refreshToken(): Promise<string | null> {
+    const generation = this.authGeneration;
     const {
       data: { session },
       error,
     } = await this.client.auth.refreshSession();
-    if (error) return null;
-    return session?.access_token ?? null;
+    if (error || generation !== this.authGeneration) return null;
+    // Read the current local session, not another network identity lookup. A
+    // refresh response may belong to an account that has since signed out.
+    const { data: current, error: sessionError } = await this.client.auth.getSession();
+    if (sessionError || generation !== this.authGeneration) return null;
+    if ((current.session?.user.id ?? null) !== (session?.user.id ?? null)) return null;
+    if (current.session?.user) await this.handleAuthStateChange(current.session.user);
+    else this.store?.setUnauthenticated();
+    return generation === this.authGeneration ? current.session?.access_token ?? null : null;
   }
 
   onAuthStateChanged(callback: (user: AuthUser | null) => void): UnsubscribeFn {
@@ -510,6 +518,14 @@ export class SupabaseAuth implements AuthProvider {
     } = this.client.auth.onAuthStateChange(
       (event: string, session: { user: SupabaseUser } | null) => {
         const user = session?.user || null;
+        const identity = user?.id ?? null;
+        if (event === 'SIGNED_OUT' ||
+            (this.authIdentity !== identity &&
+              (this.authIdentity !== undefined || event !== 'TOKEN_REFRESHED'))) {
+          ++this.authGeneration;
+        }
+        this.authIdentity = identity;
+        const generation = this.authGeneration;
 
         // PASSWORD_RECOVERY: Supabase auto-authenticates via recovery token in URL.
         // Set store flag so PasswordResetCallback component renders the new password form.
@@ -521,12 +537,14 @@ export class SupabaseAuth implements AuthProvider {
           // Await store update before firing callback so consumers see consistent state.
           this.handleAuthStateChange(user)
             .then(() => {
-              callback(mapSupabaseUserToAuthUser(user));
+              if (generation === this.authGeneration) callback(mapSupabaseUserToAuthUser(user));
             })
             .catch(() => {
-              // Store update failed (network/null store) — still fire callback with basic user data
-              // so the app isn't left in a perpetual loading state.
-              callback(mapSupabaseUserToAuthUser(user));
+              // Invalid canonical claims must not retain an earlier access grant.
+              if (generation === this.authGeneration) {
+                this.store?.setUnauthenticated();
+                callback(null);
+              }
             });
         } else {
           this.store?.setUnauthenticated();
@@ -546,16 +564,20 @@ export class SupabaseAuth implements AuthProvider {
 
   async hasFeature(featureId: string): Promise<boolean> {
     const user = await this.getCurrentUser();
-    if (!user?.customClaims) return false;
-    const features: unknown = user.customClaims.features;
+    if (!user) return false;
+    const features: unknown = user.customClaims?.features;
     return Array.isArray(features) && features.includes(featureId);
   }
 
   async hasTier(requiredTier: string): Promise<boolean> {
+    const generation = this.authGeneration;
     const user = await this.getCurrentUser();
-    if (!user?.customClaims) return false;
-    const tier: unknown = user.customClaims.tier;
-    return tier === requiredTier;
+    if (!user || generation !== this.authGeneration) return false;
+    const subscription = resolveUserSubscription(
+      user.id,
+      user.customClaims?.subscription
+    );
+    return hasTierAccess(subscription.tier, requiredTier);
   }
 
   async signInWithEmail(

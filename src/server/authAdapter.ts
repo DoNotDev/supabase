@@ -105,10 +105,7 @@ export class SupabaseServerAuthAdapter implements IServerAuthAdapter {
       return {
         uid: user.id,
         email: user.email ?? undefined,
-        claims: {
-          ...user.user_metadata,
-          ...user.app_metadata,
-        },
+        claims: { ...user.app_metadata },
       };
     } catch (error) {
       if (error instanceof DoNotDevError) throw error;
@@ -135,10 +132,7 @@ export class SupabaseServerAuthAdapter implements IServerAuthAdapter {
       uid: user.id,
       email: user.email ?? undefined,
       displayName,
-      customClaims: {
-        ...user.user_metadata,
-        ...user.app_metadata,
-      },
+      customClaims: { ...user.app_metadata },
     };
   }
 
@@ -147,9 +141,9 @@ export class SupabaseServerAuthAdapter implements IServerAuthAdapter {
     claims: Record<string, unknown>
   ): Promise<void> {
     try {
-      // Pass only the new claims to updateUserById — Supabase merges app_metadata at the
-      // Postgres JSONB level (jsonb || jsonb), which is atomic and eliminates the
-      // read-modify-write race that would occur if we fetched then merged in application code.
+      // Send only changed keys: Auth merges app_metadata and null removes a key.
+      // Do not replay a stale application snapshot. This is not a compare-and-set
+      // guarantee: concurrent authorization writers still need coordination.
       // Use only app_metadata — never user_metadata (user-editable) to prevent privilege escalation.
       const { error } = await this.client.auth.admin.updateUserById(uid, {
         app_metadata: claims,

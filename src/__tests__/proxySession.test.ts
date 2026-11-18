@@ -114,6 +114,25 @@ afterEach(() => {
 });
 
 describe('refreshSupabaseSession', () => {
+  it('binds forwarded render identity and subscription to getUser, not a tampered cookie', async () => {
+    const verified = { ...user, app_metadata: { role: 'user', subscription: {
+      tier: 'free', status: 'active', subscriptionEnd: null, updatedAt: '2026-11-01T00:00:00.000Z',
+    } } };
+    authApi({ user: () => json(200, verified) });
+    const expires = now() + 3600;
+    const forged = JSON.parse(stringFromBase64URL(sessionCookie(expires).slice('base64-'.length)));
+    forged.user = { ...user, id: 'victim', app_metadata: { role: 'super', subscription: {
+      ...verified.app_metadata.subscription, tier: 'pro',
+    } } };
+    const req = request({ [KEY]: `base64-${stringToBase64URL(JSON.stringify(forged))}` });
+    const auth = await refreshSupabaseSession(req, URL_, 'key');
+    const forwarded = req.cookies.getAll().map(({ name, value }) => `${name}=${encodeURIComponent(value)}`).join('; ');
+    const snapshot = readSupabaseSessionCookie(forwarded);
+    expect(auth.session?.user).toMatchObject({ id: 'u1', role: 'user' });
+    expect(snapshot?.user).toEqual(auth.session?.user);
+    expect(snapshot?.userSubscription).toMatchObject({ userId: 'u1', tier: 'free' });
+  });
+
   it('keeps a valid session: signed in, nothing rewritten', async () => {
     const fetchMock = authApi({ user: () => json(200, user) });
     const req = request({ [KEY]: sessionCookie(now() + 3600) });
@@ -156,6 +175,25 @@ describe('refreshSupabaseSession', () => {
     expect(writtenSession(res.set).refresh_token).toBe('refresh-2');
     expect(res.set.find((c) => c.value)?.options?.maxAge).toBeGreaterThan(0);
     expect(res.headers.get('cache-control')).toMatch(/no-store/);
+  });
+
+  it('binds refreshed response cookies too: Next merges them into the render request', async () => {
+    const fresh = now() + 3600;
+    const refreshedUser = { ...user, user_metadata: { name: 'x'.repeat(12_000) }, app_metadata: { role: 'admin' } };
+    authApi({
+      refresh: () => json(200, {
+        access_token: jwt(fresh), refresh_token: 'refresh-2', token_type: 'bearer',
+        expires_in: 3600, expires_at: fresh, user: refreshedUser,
+      }),
+      user: () => json(200, user),
+    });
+    const req = request({ [KEY]: sessionCookie(now() - 60) });
+    const auth = await refreshSupabaseSession(req, URL_, 'key');
+    const res = auth.apply(response());
+    expect(writtenSession(res.set).user).toEqual(user);
+    expect(auth.session?.user?.role).toBe('user');
+    // The larger refresh response was chunked; stale chunks must be cleared.
+    expect(res.set.some((write) => write.name.endsWith('.1') && write.options?.maxAge === 0)).toBe(true);
   });
 
   it('keeps refreshed cookies session-only when "remember me" was off', async () => {
@@ -223,7 +261,45 @@ describe('refreshSupabaseSession', () => {
     expect(req.jar.has(KEY)).toBe(false);
   });
 
-  it('cannot tell when Supabase is unreachable, and leaves the cookies alone', async () => {
+  it('does not let refreshed response cookies restore a render identity rejected by getUser', async () => {
+    const fresh = now() + 3600;
+    authApi({
+      refresh: () => json(200, {
+        access_token: jwt(fresh), refresh_token: 'refresh-2', token_type: 'bearer',
+        expires_in: 3600, expires_at: fresh, user: { ...user, app_metadata: { role: 'admin' } },
+      }),
+      user: () => json(403, {
+        code: 'session_not_found', error_code: 'session_not_found', msg: 'Session not found',
+      }),
+    });
+    const req = request({ [KEY]: sessionCookie(now() - 60) });
+    const auth = await refreshSupabaseSession(req, URL_, 'key');
+    expect(auth.session).toEqual({ user: null });
+    expect(req.jar.has(KEY)).toBe(false);
+    const res = auth.apply(response());
+    // Next merges Set-Cookie back into the render request. Deleting only request
+    // cookies is insufficient if an earlier refresh still writes a live session.
+    expect(res.set.filter((write) => write.name.startsWith(KEY) && write.value)).toEqual([]);
+    expect(res.set.find((write) => write.name === KEY)?.options?.maxAge).toBe(0);
+  });
+
+  it('does not write an unverified refresh back after a subsequent getUser outage', async () => {
+    const fresh = now() + 3600;
+    authApi({
+      refresh: () => json(200, {
+        access_token: jwt(fresh), refresh_token: 'refresh-2', token_type: 'bearer',
+        expires_in: 3600, expires_at: fresh, user,
+      }),
+      user: () => json(503, { message: 'Auth unavailable' }),
+    });
+    const req = request({ [KEY]: sessionCookie(now() - 60) });
+    const auth = await refreshSupabaseSession(req, URL_, 'key');
+    expect(auth.session).toBeNull();
+    expect(req.jar.has(KEY)).toBe(false);
+    expect(auth.apply(response()).set).toEqual([]);
+  });
+
+  it('cannot tell on an outage: preserves browser session but never forwards unverified render identity', async () => {
     authApi({
       refresh: () => {
         throw new TypeError('fetch failed');
@@ -238,7 +314,8 @@ describe('refreshSupabaseSession', () => {
     const auth = await pending;
     vi.useRealTimers();
     expect(auth.session).toBeNull();
-    expect(req.jar.get(KEY)).toBe(cookie);
+    expect(req.jar.has(KEY)).toBe(false);
+    expect(auth.apply(response()).set).toEqual([]);
   });
 
   it('is signed out without a session cookie, without calling Supabase', async () => {
