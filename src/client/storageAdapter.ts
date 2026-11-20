@@ -60,7 +60,7 @@ export class SupabaseStorageAdapter implements IStorageAdapter {
 
       const { data, error } = await this.client.storage
         .from(this.bucket)
-        .upload(uploadPath, file, { upsert: true });
+        .upload(uploadPath, file, { upsert: true, cacheControl: '31536000' });
 
       if (error)
         throw wrapStorageError(

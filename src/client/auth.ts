@@ -495,21 +495,46 @@ export class SupabaseAuth implements AuthProvider {
     return session?.access_token ?? null;
   }
 
+  /**
+   * Refresh the session and apply the canonical auth state before resolving.
+   *
+   * @throws DoNotDevError (via `wrapAuthError`) when Supabase `refreshSession()`
+   * or `getSession()` returns an error (e.g. `refresh_token_not_found`).
+   * @returns the new access token, or `null` only when the auth state changed
+   * during the refresh (sign-out, account switch, newer auth event) so the
+   * result was discarded as superseded. Each superseded branch logs its reason
+   * with the `[SupabaseAuth]` prefix.
+   */
   async refreshToken(): Promise<string | null> {
     const generation = this.authGeneration;
     const {
       data: { session },
       error,
     } = await this.client.auth.refreshSession();
-    if (error || generation !== this.authGeneration) return null;
+    if (error) throw wrapAuthError(error, 'SupabaseAuth', 'refreshToken');
+    if (generation !== this.authGeneration) {
+      console.error('[SupabaseAuth] refreshToken superseded: auth changed during refreshSession');
+      return null;
+    }
     // Read the current local session, not another network identity lookup. A
     // refresh response may belong to an account that has since signed out.
     const { data: current, error: sessionError } = await this.client.auth.getSession();
-    if (sessionError || generation !== this.authGeneration) return null;
-    if ((current.session?.user.id ?? null) !== (session?.user.id ?? null)) return null;
+    if (sessionError) throw wrapAuthError(sessionError, 'SupabaseAuth', 'refreshToken');
+    if (generation !== this.authGeneration) {
+      console.error('[SupabaseAuth] refreshToken superseded: auth changed during getSession');
+      return null;
+    }
+    if ((current.session?.user.id ?? null) !== (session?.user.id ?? null)) {
+      console.error('[SupabaseAuth] refreshToken superseded: refreshed session user differs from current session user');
+      return null;
+    }
     if (current.session?.user) await this.handleAuthStateChange(current.session.user);
     else this.store?.setUnauthenticated();
-    return generation === this.authGeneration ? current.session?.access_token ?? null : null;
+    if (generation !== this.authGeneration) {
+      console.error('[SupabaseAuth] refreshToken superseded: auth changed while applying refreshed state');
+      return null;
+    }
+    return current.session?.access_token ?? null;
   }
 
   onAuthStateChanged(callback: (user: AuthUser | null) => void): UnsubscribeFn {

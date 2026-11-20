@@ -48,11 +48,23 @@ function sessionCookie(expiresAt: number): string {
   )}`;
 }
 
-/** NextRequest['cookies'] stand-in. */
-function request(cookies: Record<string, string>) {
+/** Fetch Metadata of a document request (address bar, link click without the client router). */
+const DOCUMENT = { 'sec-fetch-mode': 'navigate', 'sec-fetch-dest': 'document' };
+
+/** Fetch Metadata of a client-router fetch (RSC soft navigation or prefetch). */
+const ROUTER_FETCH = { 'sec-fetch-mode': 'cors', 'sec-fetch-dest': 'empty' };
+
+/** NextRequest stand-in: cookies and headers (a document request by default). */
+function request(
+  cookies: Record<string, string>,
+  headers: Record<string, string> = DOCUMENT,
+  method = 'GET'
+) {
   const jar = new Map(Object.entries(cookies));
   return {
     jar,
+    method,
+    headers: new Headers(headers),
     cookies: {
       getAll: () => [...jar].map(([name, value]) => ({ name, value })),
       set: (name: string, value: string) => jar.set(name, value),
@@ -84,16 +96,19 @@ const json = (status: number, body: unknown) =>
     headers: { 'content-type': 'application/json' },
   });
 
-/** Stub the Auth API: `/token` (refresh) and `/user` (getUser) handlers. */
+/** Stub the Auth API: `/token` (refresh), `/user` (getUser) and JWKS (getClaims) handlers. */
 function authApi(handlers: {
   refresh?: () => Response | Promise<Response>;
   user?: () => Response | Promise<Response>;
+  jwks?: () => Response | Promise<Response>;
 }) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input instanceof Request ? input.url : input);
     if (url.includes('/auth/v1/token') && handlers.refresh)
       return handlers.refresh();
     if (url.includes('/auth/v1/user') && handlers.user) return handlers.user();
+    if (url.includes('/auth/v1/.well-known/jwks.json') && handlers.jwks)
+      return handlers.jwks();
     throw new Error(`unexpected fetch ${url}`);
   });
   vi.stubGlobal('fetch', fetchMock);
@@ -323,5 +338,210 @@ describe('refreshSupabaseSession', () => {
     const auth = await refreshSupabaseSession(request({}), URL_, 'key');
     expect(auth.session).toEqual({ user: null });
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+/** Asymmetric (ES256) project key: a signed access token and the JWKS that verifies it. */
+async function es256Project(kid: string) {
+  const { privateKey, publicKey } = await crypto.subtle.generateKey(
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    true,
+    ['sign', 'verify']
+  );
+  const jwk = await crypto.subtle.exportKey('jwk', publicKey);
+  const part = (o: object) => stringToBase64URL(JSON.stringify(o));
+  const sign = async (claims: Record<string, unknown>) => {
+    const input = `${part({ alg: 'ES256', typ: 'JWT', kid })}.${part(claims)}`;
+    const signature = new Uint8Array(
+      await crypto.subtle.sign(
+        { name: 'ECDSA', hash: 'SHA-256' },
+        privateKey,
+        new TextEncoder().encode(input)
+      )
+    );
+    const b64 = btoa(String.fromCharCode(...signature))
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+    return `${input}.${b64}`;
+  };
+  const jwks = { keys: [{ ...jwk, kid, alg: 'ES256', use: 'sig', key_ops: ['verify'] }] };
+  return { sign, jwks };
+}
+
+/** Session cookie carrying a given access token (and cookie user). */
+function sessionCookieWith(accessToken: string, expiresAt: number, cookieUser: object = user) {
+  return `base64-${stringToBase64URL(
+    JSON.stringify({
+      access_token: accessToken,
+      refresh_token: 'refresh-1',
+      token_type: 'bearer',
+      expires_in: 3600,
+      expires_at: expiresAt,
+      user: cookieUser,
+    })
+  )}`;
+}
+
+/** Claims Supabase Auth signs into an access token for `user`. */
+const claimsOf = (exp: number) => ({
+  sub: 'u1',
+  aud: 'authenticated',
+  role: 'authenticated',
+  exp,
+  iat: exp - 3600,
+  iss: `${URL_}/auth/v1`,
+  session_id: 's1',
+  aal: 'aal1',
+  email: 'pro@example.com',
+  is_anonymous: false,
+  app_metadata: { role: 'user' },
+  user_metadata: {},
+});
+
+describe('refreshSupabaseSession on client-router fetches (getClaims)', () => {
+  it('verifies an ES256 token locally: signed in, no Auth user call, identity from the claims', async () => {
+    const project = await es256Project('kid-local');
+    const expires = now() + 3600;
+    const token = await project.sign(claimsOf(expires));
+    const fetchMock = authApi({ jwks: () => json(200, project.jwks) });
+    // Cookie user tampered (role, metadata): never forwarded, the signed claims are
+    const tampered = { ...user, app_metadata: { role: 'super' } };
+    const req = request({ [KEY]: sessionCookieWith(token, expires, tampered) }, ROUTER_FETCH);
+    const auth = await refreshSupabaseSession(req, URL_, 'key');
+
+    expect(auth.session?.user).toMatchObject({ id: 'u1', role: 'user', email: 'pro@example.com' });
+    expect(auth.session?.accessToken).toBe(token);
+    const forwarded = req.cookies.getAll().map(({ name, value }) => `${name}=${encodeURIComponent(value)}`).join('; ');
+    expect(readSupabaseSessionCookie(forwarded)?.user).toEqual(auth.session?.user);
+    expect(fetchMock.mock.calls.some(([u]) => String(u).includes('/auth/v1/user'))).toBe(false);
+    expect(auth.apply(response()).set).toEqual([]);
+  });
+
+  it('ignores forged cookie user fields, same user or not: the forwarded user is the claims', async () => {
+    const project = await es256Project('kid-forged-cookie');
+    const expires = now() + 3600;
+    const token = await project.sign(claimsOf(expires));
+    authApi({ jwks: () => json(200, project.jwks) });
+    for (const forged of [
+      { ...user, id: 'victim', email: 'victim@example.com' },
+      // Same user forging non-claim fields: never forwarded
+      { ...user, email_confirmed_at: '2026-11-01T00:00:00Z', user_metadata: { full_name: 'Forged' }, app_metadata: { role: 'super' } },
+    ]) {
+      const req = request({ [KEY]: sessionCookieWith(token, expires, forged) }, ROUTER_FETCH);
+      const auth = await refreshSupabaseSession(req, URL_, 'key');
+      expect(auth.session?.user).toMatchObject({ id: 'u1', email: 'pro@example.com', role: 'user', emailVerified: false });
+      expect(auth.session?.user?.displayName).toBeUndefined();
+      const forwarded = req.cookies.getAll().map(({ name, value }) => `${name}=${encodeURIComponent(value)}`).join('; ');
+      expect(readSupabaseSessionCookie(forwarded)?.user).toEqual(auth.session?.user);
+      // No refresh: the claims-only user stays in the render request, never the browser
+      expect(auth.apply(response()).set.filter((write) => write.name.startsWith(KEY))).toEqual([]);
+    }
+  });
+
+  it('refreshes an expired token: render and response cookies carry the user Auth returned', async () => {
+    const project = await es256Project('kid-refresh');
+    const fresh = now() + 3600;
+    const freshToken = await project.sign(claimsOf(fresh));
+    const staleToken = await project.sign(claimsOf(now() - 60));
+    // Full user record from Auth's /token response in this request
+    const refreshedUser = {
+      ...user,
+      identities: [{ provider: 'email', identity_id: 'i1' }],
+    };
+    const fetchMock = authApi({
+      refresh: () => json(200, {
+        access_token: freshToken, refresh_token: 'refresh-2', token_type: 'bearer',
+        expires_in: 3600, expires_at: fresh, user: refreshedUser,
+      }),
+      jwks: () => json(200, project.jwks),
+    });
+    // Incoming cookie user forged: replaced by the refreshed one
+    const forged = { ...user, app_metadata: { role: 'super' } };
+    const req = request({ [KEY]: sessionCookieWith(staleToken, now() - 60, forged) }, ROUTER_FETCH);
+    const auth = await refreshSupabaseSession(req, URL_, 'key');
+
+    expect(auth.session?.user).toMatchObject({ id: 'u1', role: 'user', emailVerified: true });
+    expect(auth.session?.accessToken).toBe(freshToken);
+    const urls = fetchMock.mock.calls.map(([u]) => String(u));
+    expect(urls.some((u) => u.includes('/auth/v1/token'))).toBe(true);
+    expect(urls.some((u) => u.includes('/auth/v1/user'))).toBe(false);
+    const written = writtenSession(auth.apply(response()).set);
+    expect(written.refresh_token).toBe('refresh-2');
+    expect(written.access_token).toBe(freshToken);
+    expect(written.user).toEqual(refreshedUser);
+    expect(written.user.email_confirmed_at).toBe('2026-11-01T00:00:00Z');
+  });
+
+  it('fails loud when the refreshed session user is not the verified token subject', async () => {
+    const project = await es256Project('kid-refresh-mismatch');
+    const fresh = now() + 3600;
+    const freshToken = await project.sign(claimsOf(fresh));
+    authApi({
+      refresh: () => json(200, {
+        access_token: freshToken, refresh_token: 'refresh-2', token_type: 'bearer',
+        expires_in: 3600, expires_at: fresh, user: { ...user, id: 'someone-else' },
+      }),
+      jwks: () => json(200, project.jwks),
+    });
+    const req = request({ [KEY]: sessionCookieWith(await project.sign(claimsOf(now() - 60)), now() - 60) }, ROUTER_FETCH);
+    await expect(refreshSupabaseSession(req, URL_, 'key')).rejects.toThrow(
+      'Refreshed Supabase session user does not match the verified token'
+    );
+  });
+
+  it('signs out a token whose signature does not verify', async () => {
+    const project = await es256Project('kid-forged');
+    const forger = await es256Project('kid-forged');
+    const expires = now() + 3600;
+    const token = await forger.sign(claimsOf(expires));
+    authApi({ jwks: () => json(200, project.jwks) });
+    const req = request({ [KEY]: sessionCookieWith(token, expires) }, ROUTER_FETCH);
+    const auth = await refreshSupabaseSession(req, URL_, 'key');
+    expect(auth.session).toEqual({ user: null });
+    expect(req.jar.has(KEY)).toBe(false);
+  });
+
+  it('cannot tell when the JWKS is unreachable: no unverified identity forwarded', async () => {
+    const project = await es256Project('kid-outage');
+    const expires = now() + 3600;
+    const token = await project.sign(claimsOf(expires));
+    authApi({ jwks: () => json(503, { message: 'unavailable' }) });
+    const req = request({ [KEY]: sessionCookieWith(token, expires) }, ROUTER_FETCH);
+    const auth = await refreshSupabaseSession(req, URL_, 'key');
+    expect(auth.session).toBeNull();
+    expect(req.jar.has(KEY)).toBe(false);
+    expect(auth.apply(response()).set).toEqual([]);
+  });
+
+  it('legacy HS256 project: getClaims verifies with Auth, same verdict', async () => {
+    const fetchMock = authApi({ user: () => json(200, user) });
+    const req = request({ [KEY]: sessionCookie(now() + 3600) }, ROUTER_FETCH);
+    const auth = await refreshSupabaseSession(req, URL_, 'key');
+    expect(auth.session?.user?.id).toBe('u1');
+    expect(fetchMock.mock.calls.some(([u]) => String(u).includes('/auth/v1/user'))).toBe(true);
+  });
+
+  it('documents, Server Actions (any POST) and requests without Fetch Metadata keep getUser', async () => {
+    const project = await es256Project('kid-documents');
+    const expires = now() + 3600;
+    const token = await project.sign(claimsOf(expires));
+    const cases: Array<[Record<string, string>, string]> = [
+      [DOCUMENT, 'GET'],
+      [{}, 'GET'],
+      [{ ...ROUTER_FETCH, 'next-action': 'a1' }, 'POST'],
+      // Multipart form POST without Next-Action: Next treats it as a Server Action
+      [{ ...ROUTER_FETCH, 'content-type': 'multipart/form-data; boundary=x' }, 'POST'],
+      [{ ...ROUTER_FETCH, 'content-type': 'application/x-www-form-urlencoded' }, 'POST'],
+    ];
+    for (const [headers, method] of cases) {
+      const fetchMock = authApi({ user: () => json(200, user), jwks: () => json(200, project.jwks) });
+      const req = request({ [KEY]: sessionCookieWith(token, expires) }, headers, method);
+      const auth = await refreshSupabaseSession(req, URL_, 'key');
+      expect(auth.session?.user?.id).toBe('u1');
+      const urls = fetchMock.mock.calls.map(([u]) => String(u));
+      expect(urls.some((u) => u.includes('/auth/v1/user'))).toBe(true);
+      expect(urls.some((u) => u.includes('jwks.json'))).toBe(false);
+    }
   });
 });

@@ -4,7 +4,8 @@
  * @donotdev/supabase/server — Server exports: auth admin (SupabaseServerAuthAdapter,
  * createServerClient), public reads (SupabaseCrudAdapter, createPublicServerClient) and
  * the session check and refresh of the generated Next proxy (hasSupabaseSessionCookie,
- * refreshSupabaseSession).
+ * refreshSupabaseSession) and the database webhook reader of the generated revalidation
+ * route (readDatabaseWebhook).
  *
  * @packageDocumentation
  */
@@ -17,9 +18,14 @@ export {
   hasSupabaseSessionCookie,
   refreshSupabaseSession,
   type ProxyRequestCookies,
+  type ProxyRequestHeaders,
   type ProxyResponse,
   type SupabaseProxySession,
 } from './proxySession';
+export {
+  readDatabaseWebhook,
+  type DatabaseWebhookChange,
+} from './databaseWebhook';
 export {
   createEntityAwareMapper,
   defaultFieldMapper,
