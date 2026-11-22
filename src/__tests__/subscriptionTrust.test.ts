@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { AuthRefreshDiscardedError, AuthSessionMissingError } from '@supabase/supabase-js';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { AuthActions, AuthState } from '@donotdev/core';
 import { resolveUserSubscription } from '@donotdev/core';
@@ -79,6 +80,32 @@ describe('Supabase canonical subscription and metadata trust', () => {
     auth.getSession.mockResolvedValueOnce({ data: { session: null } });
     expect(await provider.refreshToken()).toBeNull();
     expect(store.setUnauthenticated).toHaveBeenCalled();
+  });
+
+  // REGRESSION: Supabase discards a refresh when another one (another tab, the proxy
+  // rewriting the cookie) or a sign-out changed the stored session meanwhile; that
+  // no-op was thrown to the app as a refresh failure
+  it('applies the stored session when Supabase discards the refresh', async () => {
+    const { provider, auth, store } = harness();
+    const session = { access_token: 'rotated-elsewhere', user: user() };
+    auth.refreshSession.mockResolvedValueOnce({ data: { session: null }, error: new AuthRefreshDiscardedError() });
+    auth.getSession.mockResolvedValueOnce({ data: { session } });
+    expect(await provider.refreshToken()).toBe('rotated-elsewhere');
+    expect(store.setAuthenticated).toHaveBeenCalled();
+  });
+
+  it('returns null when the refresh was discarded by a sign-out', async () => {
+    const { provider, auth, store } = harness();
+    auth.refreshSession.mockResolvedValueOnce({ data: { session: null }, error: new AuthRefreshDiscardedError() });
+    auth.getSession.mockResolvedValueOnce({ data: { session: null } });
+    expect(await provider.refreshToken()).toBeNull();
+    expect(store.setUnauthenticated).toHaveBeenCalled();
+  });
+
+  it('still throws any other refresh error', async () => {
+    const { provider, auth } = harness();
+    auth.refreshSession.mockResolvedValueOnce({ data: { session: null }, error: new AuthSessionMissingError() });
+    await expect(provider.refreshToken()).rejects.toThrow();
   });
 
   it('rejects malformed present subscription rather than granting free or retaining earlier access', async () => {

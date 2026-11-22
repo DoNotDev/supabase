@@ -24,7 +24,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
  *
  * @example
  * ```ts
- * const crud = new SupabaseCrudAdapter(createPublicServerClient(url, publicKey));
+ * const crud = new SupabasePublicReader(createPublicServerClient(url, publicKey));
  * ```
  *
  * @version 0.1.0

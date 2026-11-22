@@ -1152,7 +1152,34 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
     if (operationOptions?.signal?.aborted) {
       throw new Error('Operation cancelled');
     }
-    const queryRole = schema ? await this.getUserRole() : null;
+    const role = schema ? await this.getUserRole() : null;
+    return this.queryAs<T>(role, collection, options, schema, operationOptions);
+  }
+
+  /**
+   * {@link query} for a resolved requester role. With a role (and a schema): the columns
+   * that role may read are selected and each row is filtered by field visibility. Without
+   * one (`null`): every column RLS returns (`select=*`), unfiltered, keyed by the schema's
+   * entity field names when a schema is given (`SupabasePublicReader`), else camelCased.
+   *
+   * @param queryRole - Requester role deciding columns and visibility; `null`: none
+   * @param collection - Table
+   * @param options - Filters, order, cursor and page size
+   * @param schema - Entity schema: field names of the rows (and visibility, with a role)
+   * @param operationOptions - Abort signal
+   * @returns Page of rows with their `id`
+   * @since 0.3.2
+   */
+  protected async queryAs<T>(
+    queryRole: UserRole | null,
+    collection: string,
+    options: QueryOptions,
+    schema: dndevSchema<unknown> | undefined,
+    operationOptions?: CrudOperationOptions
+  ): Promise<PaginatedQueryResult<T>> {
+    if (operationOptions?.signal?.aborted) {
+      throw new Error('Operation cancelled');
+    }
     const selectCols =
       schema && queryRole
         ? this.buildSelectColumns(collection, schema, queryRole)
@@ -1226,11 +1253,11 @@ export class SupabaseCrudAdapter implements ICrudAdapter {
 
     if (error) {
       if (this.noteMissingTranslationColumn(collection, error))
-        return this.query<T>(
+        return this.queryAs<T>(
+          queryRole,
           collection,
           options,
           schema,
-          _schemaType,
           operationOptions
         );
       const message =

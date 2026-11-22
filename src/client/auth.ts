@@ -9,6 +9,7 @@
  * @author AMBROISE PARK Consulting
  */
 
+import { isAuthRefreshDiscardedError } from '@supabase/supabase-js';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
@@ -498,10 +499,15 @@ export class SupabaseAuth implements AuthProvider {
   /**
    * Refresh the session and apply the canonical auth state before resolving.
    *
+   * A refresh Supabase discards (`AuthRefreshDiscardedError`: another refresh, from
+   * another tab or the proxy rewriting the session cookie, or a sign-out changed the
+   * stored session during this one) is not an error: the stored session is the
+   * canonical one, so it is applied and its token returned (`null` when signed out).
+   *
    * @throws DoNotDevError (via `wrapAuthError`) when Supabase `refreshSession()`
-   * or `getSession()` returns an error (e.g. `refresh_token_not_found`).
-   * @returns the new access token, or `null` only when the auth state changed
-   * during the refresh (sign-out, account switch, newer auth event) so the
+   * or `getSession()` returns any other error (e.g. `refresh_token_not_found`).
+   * @returns the access token of the current session, or `null` when the auth state
+   * changed during the refresh (sign-out, account switch, newer auth event) so the
    * result was discarded as superseded. Each superseded branch logs its reason
    * with the `[SupabaseAuth]` prefix.
    */
@@ -511,7 +517,8 @@ export class SupabaseAuth implements AuthProvider {
       data: { session },
       error,
     } = await this.client.auth.refreshSession();
-    if (error) throw wrapAuthError(error, 'SupabaseAuth', 'refreshToken');
+    const discarded = isAuthRefreshDiscardedError(error);
+    if (error && !discarded) throw wrapAuthError(error, 'SupabaseAuth', 'refreshToken');
     if (generation !== this.authGeneration) {
       console.error('[SupabaseAuth] refreshToken superseded: auth changed during refreshSession');
       return null;
@@ -524,7 +531,7 @@ export class SupabaseAuth implements AuthProvider {
       console.error('[SupabaseAuth] refreshToken superseded: auth changed during getSession');
       return null;
     }
-    if ((current.session?.user.id ?? null) !== (session?.user.id ?? null)) {
+    if (!discarded && (current.session?.user.id ?? null) !== (session?.user.id ?? null)) {
       console.error('[SupabaseAuth] refreshToken superseded: refreshed session user differs from current session user');
       return null;
     }
