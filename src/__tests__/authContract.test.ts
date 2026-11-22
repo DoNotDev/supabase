@@ -8,6 +8,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+import { configureProviders, resetProviders } from '@donotdev/core';
 import type { AuthProvider, SecurityContext } from '@donotdev/core';
 
 import { SupabaseAuth } from '../client/auth';
@@ -125,6 +126,35 @@ describe('SupabaseAuth — AuthProvider contract', () => {
     });
   });
 
+  it('listUsers() throws with code LIST_USERS_REQUIRES_SERVER without a callable provider', async () => {
+    resetProviders();
+    await expect(provider.listUsers()).rejects.toMatchObject({
+      message: expect.stringContaining('list-auth-users'),
+      details: { originalCode: 'LIST_USERS_REQUIRES_SERVER' },
+    });
+  });
+
+  it('listUsers() calls the list-auth-users function and returns its users', async () => {
+    const users = [
+      {
+        id: 'u1',
+        email: 'a@example.com',
+        emailConfirmedAt: null,
+        createdAt: '2026-01-01T00:00:00Z',
+        lastSignInAt: null,
+        displayName: null,
+      },
+    ];
+    const call = vi.fn().mockResolvedValue({ users });
+    configureProviders({ callable: { call } } as never);
+    try {
+      await expect(provider.listUsers()).resolves.toEqual(users);
+      expect(call).toHaveBeenCalledWith('list-auth-users', {});
+    } finally {
+      resetProviders();
+    }
+  });
+
   it('has required AuthProvider methods', () => {
     expect(typeof provider.initialize).toBe('function');
     expect(typeof provider.getCurrentUser).toBe('function');
@@ -191,6 +221,45 @@ describe('SupabaseAuth — AuthProvider contract', () => {
     await expect(
       provider.sendPasswordResetEmail('reset@example.com')
     ).resolves.toBeUndefined();
+  });
+
+  it('verifyEmailCode() verifies the sign-up code and returns the mapped user', async () => {
+    const auth = (client as unknown as { auth: Record<string, ReturnType<typeof vi.fn>> }).auth;
+    auth.verifyOtp!.mockResolvedValue({
+      data: {
+        user: {
+          id: 'u1',
+          email: 'new@example.com',
+          email_confirmed_at: '2026-11-22T00:00:00Z',
+          user_metadata: {},
+          app_metadata: {},
+        },
+        session: { access_token: 't' },
+      },
+      error: null,
+    });
+    const user = await provider.verifyEmailCode('new@example.com', '12345678');
+    expect(auth.verifyOtp).toHaveBeenCalledWith({
+      email: 'new@example.com',
+      token: '12345678',
+      type: 'signup',
+    });
+    expect(user.id).toBe('u1');
+    expect(user.email).toBe('new@example.com');
+  });
+
+  it('verifyEmailCode() keeps the GoTrue code of a wrong code in details.originalCode', async () => {
+    const auth = (client as unknown as { auth: Record<string, ReturnType<typeof vi.fn>> }).auth;
+    auth.verifyOtp!.mockResolvedValue({
+      data: { user: null, session: null },
+      error: Object.assign(new Error('Token has expired or is invalid'), {
+        code: 'otp_expired',
+        status: 403,
+      }),
+    });
+    await expect(
+      provider.verifyEmailCode('new@example.com', '00000000')
+    ).rejects.toMatchObject({ details: { originalCode: 'otp_expired' } });
   });
 });
 

@@ -16,6 +16,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import type {
   AuthProvider,
   AuthUser,
+  AuthUserSummary,
   AuthResult,
   AuthPartnerId,
   AuthMethod,
@@ -28,6 +29,7 @@ import type {
   SecurityContext,
   AuthHardeningContext,
   AuthSessionSnapshot,
+  ListAuthUsersResponse,
 } from '@donotdev/core';
 import {
   isClient,
@@ -864,6 +866,45 @@ export class SupabaseAuth implements AuthProvider {
     }
   }
 
+  /**
+   * Confirm a sign-up address with the code from the confirmation email
+   * (`verifyOtp`, type `signup`; the code length is the project's
+   * `mailer_otp_length`). supabase-js saves the returned session, so the auth state
+   * change signs the user in.
+   *
+   * @param email - The address that signed up
+   * @param code - The code typed by the user
+   * @returns The confirmed user
+   * @throws DoNotDevError via `wrapAuthError`; GoTrue's code (`otp_expired` for a
+   *   wrong or expired code, `over_request_rate_limit`...) stays in
+   *   `details.originalCode`
+   */
+  async verifyEmailCode(email: string, code: string): Promise<AuthUser> {
+    try {
+      const {
+        data: { user },
+        error,
+      } = await this.client.auth.verifyOtp({
+        email,
+        token: code,
+        type: 'signup',
+      });
+      if (error) throw wrapAuthError(error, 'SupabaseAuth', 'verifyEmailCode');
+      if (!user) {
+        throw wrapAuthError(
+          new Error('Email confirmation failed'),
+          'SupabaseAuth',
+          'verifyEmailCode'
+        );
+      }
+      // Store update handled by onAuthStateChanged
+      return mapSupabaseUserToAuthUser(user);
+    } catch (error) {
+      if (error instanceof DoNotDevError) throw error;
+      throw wrapAuthError(error, 'SupabaseAuth', 'verifyEmailCode');
+    }
+  }
+
   async sendSignInLinkToEmail(
     email: string,
     actionCodeSettings?: { url: string; handleCodeInApp: boolean }
@@ -1071,6 +1112,32 @@ export class SupabaseAuth implements AuthProvider {
     } catch (error) {
       if (error instanceof DoNotDevError) throw error;
       throw wrapAuthError(error, 'SupabaseAuth', 'deleteAccount');
+    }
+  }
+
+  /**
+   * List every auth account (admin apps). Calls the app's admin-only `list-auth-users`
+   * Edge Function (`createListAuthUsers` from `@donotdev/functions/supabase`) through the
+   * callable provider; the function refuses non-admins (403).
+   */
+  async listUsers(): Promise<AuthUserSummary[]> {
+    try {
+      if (!hasProvider('callable')) {
+        throw Object.assign(
+          new Error(
+            'Listing users requires a server endpoint. Configure a callable provider and deploy the list-auth-users Edge Function.'
+          ),
+          { code: 'LIST_USERS_REQUIRES_SERVER' }
+        );
+      }
+      const { users } = await getProvider('callable').call<
+        Record<string, never>,
+        ListAuthUsersResponse
+      >('list-auth-users', {});
+      return users;
+    } catch (error) {
+      if (error instanceof DoNotDevError) throw error;
+      throw wrapAuthError(error, 'SupabaseAuth', 'listUsers');
     }
   }
 

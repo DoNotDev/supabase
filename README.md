@@ -252,6 +252,7 @@ configureProviders({
 | Method | Behavior | Workaround |
 |--------|----------|------------|
 | `deleteAccount()` | Requires `callable` provider + `delete-account` edge function (both auto-configured by `dndev setup supabase`) | N/A — works out of the box |
+| `listUsers()` | Admin only. Requires `callable` provider + `list-auth-users` edge function (`createListAuthUsers` from `@donotdev/functions/supabase`) | Deploy the edge function (3-line `index.ts`) |
 | `signInWithGoogleCredential()` | Returns `null` | Use `signInWithPartner('google')` for standard OAuth flow |
 | `reauthenticateWithProvider()` | Triggers full OAuth redirect | Works but navigates away from page (no popup) |
 

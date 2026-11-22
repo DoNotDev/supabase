@@ -241,6 +241,16 @@ Deno.serve(createEdgeFunction(async (req, ctx) => {
 
 Both `createSupabaseHandler` and `createEdgeFunction` handle CORS, OPTIONS preflight, and method checking. Never manually define `CORS_HEADERS` in edge functions.
 
+### Admin User Listing
+
+`useAuthUsers()` / `useAuth('listUsers')` (`@donotdev/auth`) call the admin-only `list-auth-users` edge function, which reads every account from `auth.admin.listUsers` (no view, no copy). Non-admins get 403.
+
+```typescript
+// supabase/functions/list-auth-users/index.ts
+import { createListAuthUsers } from '@donotdev/functions/supabase';
+Deno.serve(createListAuthUsers());
+```
+
 ### Deploy Edge Functions
 
 ```bash
