@@ -44,6 +44,7 @@ import {
   wrapAuthError,
   DoNotDevError,
   safeSessionStorage,
+  getCaptchaToken,
 } from '@donotdev/core';
 import { AuthHardening } from '@donotdev/core';
 
@@ -90,6 +91,18 @@ type OAuthProvider = Parameters<
  */
 function toOAuthProvider(partnerId: AuthPartnerId): OAuthProvider {
   return (PARTNER_TO_SUPABASE[partnerId] ?? partnerId) as OAuthProvider;
+}
+
+/**
+ * `{ captchaToken }` for a call Supabase Auth gates with CAPTCHA protection (sign-up,
+ * password sign-in, OTP / magic link, resend, password-reset request), `{}` when the app
+ * sets no `TURNSTILE_SITE_KEY` (CAPTCHA off). One fresh single-use token per call
+ * (`getCaptchaToken`); a failure rejects with `captcha_failed`. Not gated: `verifyOtp`,
+ * OAuth, `updateUser`, token refresh.
+ */
+async function captchaOptions(): Promise<{ captchaToken?: string }> {
+  const captchaToken = await getCaptchaToken();
+  return captchaToken === undefined ? {} : { captchaToken };
 }
 
 // =============================================================================
@@ -269,7 +282,11 @@ export class SupabaseAuth implements AuthProvider {
       const {
         data: { user },
         error,
-      } = await this.client.auth.signInWithPassword({ email, password });
+      } = await this.client.auth.signInWithPassword({
+        email,
+        password,
+        options: await captchaOptions(),
+      });
 
       if (error) {
         this._recordFailure(email);
@@ -315,7 +332,10 @@ export class SupabaseAuth implements AuthProvider {
       } = await this.client.auth.signUp({
         email,
         password,
-        options: metadata ? { data: metadata } : undefined,
+        options: {
+          ...(metadata ? { data: metadata } : {}),
+          ...(await captchaOptions()),
+        },
       });
       if (error)
         throw wrapAuthError(
@@ -402,6 +422,7 @@ export class SupabaseAuth implements AuthProvider {
       const redirectTo = this.getPasswordResetRedirectUrl();
       const { error } = await this.client.auth.resetPasswordForEmail(email, {
         redirectTo,
+        ...(await captchaOptions()),
       });
       if (error)
         throw wrapAuthError(error, 'SupabaseAuth', 'sendPasswordResetEmail', {
@@ -857,6 +878,7 @@ export class SupabaseAuth implements AuthProvider {
       const { error } = await this.client.auth.resend({
         type: 'signup',
         email: address,
+        options: await captchaOptions(),
       });
       if (error)
         throw wrapAuthError(error, 'SupabaseAuth', 'sendEmailVerification');
@@ -915,7 +937,10 @@ export class SupabaseAuth implements AuthProvider {
         (typeof window !== 'undefined' ? window.location.href : undefined);
       const { error } = await this.client.auth.signInWithOtp({
         email,
-        options: emailRedirectTo ? { emailRedirectTo } : undefined,
+        options: {
+          ...(emailRedirectTo ? { emailRedirectTo } : {}),
+          ...(await captchaOptions()),
+        },
       });
       if (error)
         throw wrapAuthError(error, 'SupabaseAuth', 'sendSignInLinkToEmail', {
@@ -1032,6 +1057,7 @@ export class SupabaseAuth implements AuthProvider {
       const { error } = await this.client.auth.signInWithPassword({
         email: user.email,
         password,
+        options: await captchaOptions(),
       });
       if (error) {
         this._recordFailure(user.email);
