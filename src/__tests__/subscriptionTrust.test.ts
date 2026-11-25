@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AuthRefreshDiscardedError, AuthSessionMissingError } from '@supabase/supabase-js';
+import { AuthApiError, AuthRefreshDiscardedError, AuthSessionMissingError } from '@supabase/supabase-js';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { AuthActions, AuthState } from '@donotdev/core';
 import { resolveUserSubscription } from '@donotdev/core';
@@ -25,6 +25,7 @@ function harness(subscription?: unknown) {
     getSession: vi.fn().mockResolvedValue({ data: { session: { user: current } } }),
     getUser: vi.fn().mockResolvedValue({ data: { user: current } }),
     refreshSession: vi.fn(),
+    signOut: vi.fn().mockResolvedValue({ error: null }),
     onAuthStateChange: vi.fn().mockReturnValue({ data: { subscription: { unsubscribe: vi.fn() } } }),
     admin: { getUserById: vi.fn().mockResolvedValue({ data: { user: current } }), updateUserById: vi.fn().mockResolvedValue({ error: null }) },
   };
@@ -106,6 +107,28 @@ describe('Supabase canonical subscription and metadata trust', () => {
     const { provider, auth } = harness();
     auth.refreshSession.mockResolvedValueOnce({ data: { session: null }, error: new AuthSessionMissingError() });
     await expect(provider.refreshToken()).rejects.toThrow();
+  });
+
+  // REGRESSION: a refresh token reused outside the reuse window makes Auth revoke the whole
+  // token family; the still-valid access token kept the browser signed in on a session no
+  // refresh could renew, and every page load retried the dead refresh token
+  it.each(['refresh_token_already_used', 'refresh_token_not_found', 'session_not_found'])(
+    'ends the session in this browser, then throws, when Auth refuses the refresh: %s',
+    async (code) => {
+      const { provider, auth, store } = harness();
+      auth.refreshSession.mockResolvedValueOnce({ data: { session: null }, error: new AuthApiError('Invalid Refresh Token', 400, code) });
+      await expect(provider.refreshToken()).rejects.toThrow();
+      expect(auth.signOut).toHaveBeenCalledWith({ scope: 'local' });
+      expect(store.setUnauthenticated).toHaveBeenCalled();
+    }
+  );
+
+  it('keeps the session when the refresh fails for any other reason', async () => {
+    const { provider, auth, store } = harness();
+    auth.refreshSession.mockResolvedValueOnce({ data: { session: null }, error: new AuthApiError('Internal error', 500, 'unexpected_failure') });
+    await expect(provider.refreshToken()).rejects.toThrow();
+    expect(auth.signOut).not.toHaveBeenCalled();
+    expect(store.setUnauthenticated).not.toHaveBeenCalled();
   });
 
   it('rejects malformed present subscription rather than granting free or retaining earlier access', async () => {

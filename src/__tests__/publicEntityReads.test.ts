@@ -190,6 +190,8 @@ const pageSeo = (record: Record<string, unknown>, route: typeof FLATS, value: st
     buildProductJsonLd,
     buildBreadcrumbJsonLd,
     languageUrl,
+    // The breadcrumb's ancestors come from the app's routes (EntityPageContext.routes)
+    routes: [FLATS, PRODUCTS],
   });
 
 describe('SupabasePublicReader with the read schema', () => {

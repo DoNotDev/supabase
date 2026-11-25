@@ -9,7 +9,7 @@
  * @author AMBROISE PARK Consulting
  */
 
-import { isAuthRefreshDiscardedError } from '@supabase/supabase-js';
+import { isAuthApiError, isAuthRefreshDiscardedError } from '@supabase/supabase-js';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
@@ -104,6 +104,21 @@ async function captchaOptions(): Promise<{ captchaToken?: string }> {
   const captchaToken = await getCaptchaToken();
   return captchaToken === undefined ? {} : { captchaToken };
 }
+
+/**
+ * Supabase Auth error codes of a refresh refused because the session is over: no later
+ * refresh can succeed. `refresh_token_already_used` is a revoked token reused outside the
+ * reuse interval while its child is not the active token: Auth revokes the whole token
+ * family (GoTrue reuse detection, "Possible abuse attempt" in the Auth logs).
+ */
+const SESSION_ENDED_CODES: ReadonlySet<string> = new Set([
+  'refresh_token_already_used',
+  'refresh_token_not_found',
+  'session_not_found',
+  'session_expired',
+  'user_not_found',
+  'user_banned',
+]);
 
 // =============================================================================
 // SupabaseAuth
@@ -404,12 +419,21 @@ export class SupabaseAuth implements AuthProvider {
     } catch {
       // Network error or expired session — proceed with sign-out anyway
     }
-    await this.client.auth.signOut();
+    await this.endSession('global');
+    safeSessionStorage.removeItem('dndev.auth.returnTo');
+    this.security?.audit({ type: 'auth.logout', userId });
+  }
+
+  /**
+   * End the session: Supabase sign-out (`global`: every device of the user, `local`: this
+   * browser only), then the session's "remember me" choice and the auth store. Supabase
+   * removes the stored session and tells the other tabs (`SIGNED_OUT`).
+   */
+  private async endSession(scope: 'global' | 'local'): Promise<void> {
+    await this.client.auth.signOut({ scope });
     // The "do not remember me" choice belongs to the session that just ended.
     if (hasCookieSession(this.client)) setSessionOnly(false);
     this.store?.setUnauthenticated();
-    safeSessionStorage.removeItem('dndev.auth.returnTo');
-    this.security?.audit({ type: 'auth.logout', userId });
   }
 
   async sendPasswordResetEmail(email: string): Promise<void> {
@@ -527,6 +551,13 @@ export class SupabaseAuth implements AuthProvider {
    * stored session during this one) is not an error: the stored session is the
    * canonical one, so it is applied and its token returned (`null` when signed out).
    *
+   * A refresh Supabase Auth refuses because the session is over (`SESSION_ENDED_CODES`:
+   * refresh token reused outside the reuse window, which revokes the whole token family,
+   * not found, session gone or expired, user gone or banned) ends the session in this
+   * browser (local sign-out, every tab) before the error is thrown: the access token still
+   * verifies until it expires, but no refresh can ever succeed, so keeping it would retry
+   * the dead refresh token on every load.
+   *
    * @throws DoNotDevError (via `wrapAuthError`) when Supabase `refreshSession()`
    * or `getSession()` returns any other error (e.g. `refresh_token_not_found`).
    * @returns the access token of the current session, or `null` when the auth state
@@ -541,7 +572,12 @@ export class SupabaseAuth implements AuthProvider {
       error,
     } = await this.client.auth.refreshSession();
     const discarded = isAuthRefreshDiscardedError(error);
-    if (error && !discarded) throw wrapAuthError(error, 'SupabaseAuth', 'refreshToken');
+    if (error && !discarded) {
+      if (isAuthApiError(error) && error.code !== undefined && SESSION_ENDED_CODES.has(error.code)) {
+        await this.endSession('local');
+      }
+      throw wrapAuthError(error, 'SupabaseAuth', 'refreshToken');
+    }
     if (generation !== this.authGeneration) {
       console.error('[SupabaseAuth] refreshToken superseded: auth changed during refreshSession');
       return null;
